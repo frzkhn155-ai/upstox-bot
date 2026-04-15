@@ -1,0 +1,139 @@
+name: Upstox Trading Bot
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIGGERS
+#   • Schedule  : runs automatically at 09:10 IST (03:40 UTC) on weekdays
+#   • Manual    : Actions tab → "Upstox Trading Bot" → "Run workflow"
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    - cron: '40 3 * * 1-5'   # 03:40 UTC = 09:10 IST, Mon–Fri only
+
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual run (optional)'
+        required: false
+        default: 'Manual trigger'
+
+env:
+  TZ: Asia/Kolkata
+
+jobs:
+  run-bot:
+    name: Run Trading Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 390      # 6.5 hours — covers full market session + buffer
+
+    steps:
+      # ── 1. Checkout code ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install Chrome + ChromeDriver ────────────────────────────────────
+      - name: Install Google Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      # ── 4. Install Python dependencies ──────────────────────────────────────
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      # ── 5. Restore candle cache ──────────────────────────────────────────────
+      - name: Restore candle cache
+        uses: actions/cache@v4
+        with:
+          path: candle_cache/
+          key: candle-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            candle-cache-${{ runner.os }}-
+
+      # ── 6. Restore saved token ───────────────────────────────────────────────
+      - name: Restore Upstox token
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstox_token.txt
+            upstox_refresh_token.txt
+            token_timestamp.json
+          key: upstox-token-${{ runner.os }}
+          restore-keys: |
+            upstox-token-${{ runner.os }}
+
+      # ── 7. Run the bot ───────────────────────────────────────────────────────
+      - name: Run trading bot
+        env:
+          # ── Upstox credentials ───────────────────────────────────────────────
+          UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
+          UPSTOX_PASSWORD:     ${{ secrets.UPSTOX_PASSWORD }}
+          UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
+          UPSTOX_PASSCODE:     ${{ secrets.UPSTOX_PASSCODE }}
+          UPSTOX_API_KEY:      ${{ secrets.UPSTOX_API_KEY }}
+          UPSTOX_API_SECRET:   ${{ secrets.UPSTOX_API_SECRET }}
+          UPSTOX_TOKEN:        ${{ secrets.UPSTOX_TOKEN }}
+
+          # ── Chartink cookies (refresh from browser when 5min data fails) ──────
+          CHARTINK_XSRF:       ${{ secrets.CHARTINK_XSRF }}
+          CHARTINK_SESSION:    ${{ secrets.CHARTINK_SESSION }}
+
+          # ── AI providers ─────────────────────────────────────────────────────
+          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          GROQ_API_KEY_2:      ${{ secrets.GROQ_API_KEY_2 }}
+          NVIDIA_API_KEY:      ${{ secrets.NVIDIA_API_KEY }}
+
+          # ── Timezone & display ───────────────────────────────────────────────
+          TZ: Asia/Kolkata
+          DISPLAY: ':99'
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          python Both4withcache10_headless.py
+
+      # ── 8. Save updated token for next run ───────────────────────────────────
+      - name: Save Upstox token (post-run)
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            upstox_token.txt
+            upstox_refresh_token.txt
+            token_timestamp.json
+          key: upstox-token-${{ runner.os }}
+
+      # ── 9. Upload all log/CSV files as artifacts ─────────────────────────────
+      - name: Upload trading logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading-logs-${{ github.run_id }}
+          retention-days: 30
+          path: |
+            r3_live_alerts.txt
+            r3_live_alerts.csv
+            gap_trading_alerts.txt
+            gap_trading_alerts.csv
+            box_trading_alerts.txt
+            box_trading_alerts.csv
+            range_trading_alerts.txt
+            range_trading_alerts.csv
+            exits_log.txt
+            exits_log.csv
+            positions_tracking.csv
+            fast_trades_entries.csv
+            fast_trades_exits.csv
+            orb_signals.csv
+            orb_trades.csv
+            orb_trading_log.txt
+            cache_stats.json
