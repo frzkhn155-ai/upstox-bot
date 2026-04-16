@@ -124,7 +124,7 @@ MIN_ORDER_GAP_SECONDS = 300
 ORDER_VERIFICATION_DELAY = 3
 
 # TEST MODE (FALSE = normal market hours)
-TEST_MODE = True
+TEST_MODE = False
 BYPASS_MARKET_CHECKS = TEST_MODE      # used in is_market_open / is_market_stabilized
 
 # When TEST_MODE=True and the bot starts before 05:30 IST, wait until the
