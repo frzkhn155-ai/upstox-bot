@@ -40,19 +40,19 @@ from bs4 import BeautifulSoup
 sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line-buffered
 sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
-# ============ CREDENTIALS - EMBEDDED ============
-EMAIL = "frzkhn155@gmail.com"
-EMAIL_PASSWORD = "vdeahogzvpsmfirv"
-MOBILE_NUMBER = "7397408750"
-PASSCODE = "952495"
+# ============ CREDENTIALS - ENV VARS (with hardcoded fallbacks) ============
+EMAIL          = os.environ.get("UPSTOX_EMAIL",    "frzkhn155@gmail.com")
+EMAIL_PASSWORD = os.environ.get("UPSTOX_PASSWORD", "vdeahogzvpsmfirv")
+MOBILE_NUMBER  = os.environ.get("UPSTOX_MOBILE",   "7397408750")
+PASSCODE       = os.environ.get("UPSTOX_PASSCODE", "952495")
 
 # ── Upstox OAuth app credentials (for Android token refresh) ─────────────────
 # Get these from https://account.upstox.com/developer/apps → your app
 # API Key    = "Client ID" on the Upstox developer portal
 # API Secret = "Client Secret"
 # Redirect   = must match exactly what you set in the app (use the one below)
-UPSTOX_API_KEY      = "ea9b2ade-6720-4a0b-a8a5-6e1710f55844"       # ← paste Client ID here
-UPSTOX_API_SECRET   = "csxmppf5zd"    # ← paste Client Secret here
+UPSTOX_API_KEY      = os.environ.get("UPSTOX_API_KEY",    "ea9b2ade-6720-4a0b-a8a5-6e1710f55844")
+UPSTOX_API_SECRET   = os.environ.get("UPSTOX_API_SECRET", "csxmppf5zd")
 UPSTOX_REDIRECT_URI = "http://127.0.0.1:8080/"        # must match your app settings
 
 # ── Headless OAuth local server port ─────────────────────────────────────────
@@ -75,8 +75,8 @@ CHARTINK_COOKIES = {
 # 3. Copy XSRF-TOKEN and ci_session from Request Headers → Cookies
 
 # ========== HARDCODED TOKEN OPTION ==========
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIyMkM4REwiLCJqdGkiOiI2OWRlNWVkOWUwZDZmYjQ5ZDgwNDJlZjEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzc2MTgwOTUzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzYyMDQwMDB9.JN2LvN8lszxCi3YBscNF06axZxYe7GQG8o81J8H-KJ4"
-USE_HARDCODED_TOKEN = True
+HARDCODED_TOKEN = ""          # Intentionally blank — token is injected via UPSTOX_TOKEN secret
+USE_HARDCODED_TOKEN = False   # Disabled — bot reads upstox_token.txt written by the workflow
 
 # Token timestamp file
 TOKEN_TIMESTAMP_FILE = "token_timestamp.json"
@@ -1486,6 +1486,9 @@ class UpstoxLogin:
                         mail.login(self.email_address, self.email_password)
                         mail.select("inbox")
                         status, messages = mail.search(None, '(UNSEEN FROM "donotreply@transactions.upstox.com")')
+                        if status != "OK" or not messages[0]:
+                            # Fallback: Upstox sometimes sends from a different subdomain
+                            status, messages = mail.search(None, '(UNSEEN FROM "upstox")')
                         if status != "OK" or not messages[0]:
                             elapsed = int(time.time() - start_time)
                             print(f"⏳ No unread Upstox emails yet... ({elapsed}s)")
