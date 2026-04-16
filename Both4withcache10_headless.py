@@ -94,7 +94,7 @@ VOLUME_SPIKE_THRESHOLD = 1.3
 VOLUME_LOOKBACK_DAYS = 20
 USE_DYNAMIC_VOLUME_THRESHOLD = True
 MAX_WORKERS = 3
-DEBUG_MODE = True                     # <-- changed to True
+DEBUG_MODE = False                     # <-- changed to True
 BATCH_SIZE = 100
 MAX_INSTRUMENTS_PER_BATCH = 500
 
