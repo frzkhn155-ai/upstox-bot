@@ -7,7 +7,7 @@ name: Upstox Trading Bot
 # ─────────────────────────────────────────────────────────────────────────────
 on:
   schedule:
-    - cron: '40 3 * * 1-5'   # 03:40 UTC = 09:10 IST, Mon–Fri only
+    - cron: '50 8 * * 1-5'   # 03:40 UTC = 09:10 IST, Mon–Fri only
 
   workflow_dispatch:
     inputs:
