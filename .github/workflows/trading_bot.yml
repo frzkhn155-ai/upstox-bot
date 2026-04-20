@@ -37,15 +37,28 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── 3. Install Chrome + ChromeDriver ────────────────────────────────────
-      - name: Install Google Chrome
+      # ── 3. Chrome — use pre-installed runner image; upgrade only if missing ─
+      #   GitHub-hosted Ubuntu runners ship with google-chrome-stable.
+      #   The fallback uses the modern gpg keyring approach (no apt-key).
+      - name: Ensure Google Chrome is available
         run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
-            | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -q
-          sudo apt-get install -y google-chrome-stable
-          google-chrome --version
+          if command -v google-chrome &>/dev/null; then
+            echo "✅ Chrome already installed — skipping download"
+            google-chrome --version
+          else
+            echo "⚠️  Chrome not found — installing via signed keyring"
+            wget -q -O /tmp/google-chrome.gpg \
+              https://dl.google.com/linux/linux_signing_key.pub
+            sudo gpg --dearmor \
+              -o /usr/share/keyrings/google-chrome.gpg \
+              /tmp/google-chrome.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+              http://dl.google.com/linux/chrome/deb/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/google-chrome.list
+            sudo apt-get update -q
+            sudo apt-get install -y google-chrome-stable
+            google-chrome --version
+          fi
 
       # ── 4. Install Python dependencies ──────────────────────────────────────
       - name: Install Python packages
@@ -137,3 +150,14 @@ jobs:
             orb_trades.csv
             orb_trading_log.txt
             cache_stats.json
+
+      # ── 10. Upload bot debug logs on failure ─────────────────────────────────
+      - name: Upload debug logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs-${{ github.run_id }}
+          retention-days: 7
+          path: |
+            logs/
+            *.log
