@@ -278,8 +278,8 @@ FII_DII_CACHE_FILE = "fii_dii_cache.json"
 # ── FII/DII MULTI-DAY TREND ANALYSIS ─────────────────────────────────────────
 # Reads historical FII_DII_YYYYMMDD.csv files to detect institutional patterns:
 #   STRONG_ACCUMULATION : Both FII cash + FNO bought (most bullish)
-#   FII_BUY_DII_SELL    : FII bought cash, FNO sold (FII leading — bullish lean)
-#   FII_SELL_DII_BUY    : FII sold cash, FNO bought (DII support — caution)
+#   FII_BUY_DII_SELL    : FII cash bought, FNO sold (FII leading — bullish lean)
+#   FII_SELL_DII_BUY    : FII cash sold, FNO bought (DII support — caution)
 #   UNUSUAL_CHANGE      : Reversed from previous day (both sold -> both bought etc.)
 ENABLE_FII_DII_TREND_FILTER  = True   # Master switch for trend-based adjustments
 FII_DII_TREND_CACHE_FILE     = "fii_dii_trend_cache.json"
@@ -390,6 +390,7 @@ DAILY_PNL = 0.0
 CLOSED_POSITIONS = []
 TRADING_STOPPED = False
 POSITION_PEAK_PRICES = {}
+POSITION_TRAILING_SL  = {}   # Tracks the last SL trigger_price pushed to the broker per position
 
 # FAST TRADING GLOBALS
 FAST_TRADES = {}
@@ -2359,6 +2360,41 @@ class UpstoxTrader:
             return response.json()
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    def modify_order(self, order_id, trigger_price, price=0, quantity=None, order_type=None):
+        """Modify an existing SL order on Upstox (used to trail the stop loss).
+        
+        Parameters
+        ----------
+        order_id      : str   – the broker order-id of the live SL order
+        trigger_price : float – new SL trigger price
+        price         : float – new limit price (0 for SL-M / market execution)
+        quantity      : int   – lot quantity (required by Upstox modify endpoint)
+        order_type    : str   – e.g. 'SL_LIMIT' or 'SL' (keep original if None)
+        """
+        endpoint = f"{self.base_url}/order/modify"
+        payload = {
+            "order_id":      order_id,
+            "trigger_price": round(trigger_price, 2),
+            "price":         round(price, 2),
+            "validity":      "DAY",
+        }
+        if quantity is not None:
+            payload["quantity"] = quantity
+        if order_type is not None:
+            payload["order_type"] = order_type.upper()
+        try:
+            print(f"📝 MODIFY SL ORDER: id={order_id}  new_trigger=₹{trigger_price:.2f}")
+            response = self._order_session.put(endpoint, json=payload, timeout=10)
+            result = response.json() if response.text else {"status": "error", "message": "Empty response"}
+            if response.status_code == 200:
+                print(f"✅ SL Modified → trigger ₹{trigger_price:.2f}")
+            else:
+                print(f"⚠️ SL Modify failed ({response.status_code}): {result}")
+            return {"status_code": response.status_code, "response": result}
+        except Exception as e:
+            print(f"❌ SL Modify exception: {e}")
+            return {"status_code": 0, "response": {"status": "error", "message": str(e)}}
 
     def get_ltp(self, instrument_key, max_retries=3):
         endpoint = f"{self.base_url}/market-quote/ltp"
@@ -5347,7 +5383,7 @@ def get_available_margin(trader):
 
 def place_fast_trade_order(setup, trader, symbol, instrument_key):
     """Place OPTION orders for fast trading setups"""
-    global FAST_TRADE_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED
+    global FAST_TRADE_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED, POSITION_TRAILING_SL
 
     if TRADING_STOPPED:
         print("⚠️ Trading stopped - no new orders")
@@ -5500,6 +5536,8 @@ def place_fast_trade_order(setup, trader, symbol, instrument_key):
                             print(f"✅ SL Order ID: {sl_order_id}")
                             PLACED_ORDERS[order_id]['sl_order_id'] = sl_order_id
                             ACTIVE_POSITIONS[order_id]['sl_order_id'] = sl_order_id
+                            # Seed the trailing-SL tracker with the initial level
+                            POSITION_TRAILING_SL[order_id] = sl_trigger
                 except Exception as e:
                     print(f"⚠️ SL placement error: {e}")
 
@@ -7613,7 +7651,7 @@ def should_place_gap_trade(gap_info, signal):
 # ========== EXIT MANAGEMENT FUNCTIONS ==========
 def check_exit_conditions(position, current_price, trader):
     """Check if any exit condition is met for a position"""
-    global DAILY_PNL, POSITION_PEAK_PRICES
+    global DAILY_PNL, POSITION_PEAK_PRICES, POSITION_TRAILING_SL
     
     if not ENABLE_EXIT_MANAGEMENT:
         return False, None
@@ -7669,18 +7707,49 @@ def check_exit_conditions(position, current_price, trader):
         return True, "TARGET_PROFIT"
     
     # 6. TRAILING STOP-LOSS (Activate after specified profit %)
+    #    Stage 1 – initial SL order is placed immediately after entry (see entry logic).
+    #    Stage 2 – here we monitor price and MODIFY the live SL order on the broker
+    #              every time price reaches a new peak, ratcheting the stop upward.
     if ENABLE_TRAILING_STOP and pnl_percent >= TRAILING_STOP_ACTIVATION:
-        # Track peak price for this position
+        # --- update in-memory peak ---
         if position_id not in POSITION_PEAK_PRICES:
             POSITION_PEAK_PRICES[position_id] = current_price
         else:
             POSITION_PEAK_PRICES[position_id] = max(POSITION_PEAK_PRICES[position_id], current_price)
-        
-        peak_price = POSITION_PEAK_PRICES[position_id]
-        trailing_stop_price = peak_price * (1 - TRAILING_STOP_PERCENTAGE / 100)
-        
-        if current_price <= trailing_stop_price:
-            return True, f"TRAILING_STOP (Peak: ₹{peak_price:.2f})"
+
+        peak_price            = POSITION_PEAK_PRICES[position_id]
+        new_trailing_sl       = round(peak_price * (1 - TRAILING_STOP_PERCENTAGE / 100), 2)
+        last_broker_sl        = POSITION_TRAILING_SL.get(position_id)
+        sl_order_id           = position.get('sl_order_id')
+
+        # --- push updated trigger to broker only when SL has moved up meaningfully ---
+        MIN_SL_MOVE_PCT = 0.10   # only modify if SL shifted by ≥ 0.10 % (avoids API noise)
+        should_modify = (
+            sl_order_id is not None
+            and (
+                last_broker_sl is None                                        # first time activating
+                or new_trailing_sl > last_broker_sl * (1 + MIN_SL_MOVE_PCT / 100)  # moved up
+            )
+        )
+        if should_modify:
+            modify_result = trader.modify_order(
+                order_id      = sl_order_id,
+                trigger_price = new_trailing_sl,
+                price         = 0,                          # SL-M: execute at market when triggered
+                quantity      = position.get('quantity'),
+                order_type    = 'SL',                       # SL-M
+            )
+            if modify_result.get('status_code') == 200:
+                POSITION_TRAILING_SL[position_id] = new_trailing_sl
+                print(f"   🔒 Trailing SL updated → ₹{new_trailing_sl:.2f}  (peak ₹{peak_price:.2f})")
+            else:
+                # Broker modify failed – fall back to software-side check so we still exit
+                print(f"   ⚠️ Broker SL modify failed; software-side guard still active.")
+
+        # --- software-side safety net (catches the stop even if modify failed) ---
+        effective_sl = POSITION_TRAILING_SL.get(position_id, new_trailing_sl)
+        if current_price <= effective_sl:
+            return True, f"TRAILING_STOP (Peak: ₹{peak_price:.2f}, SL: ₹{effective_sl:.2f})"
     
     # 7. STRATEGY-SPECIFIC EXITS
     if ENABLE_STRATEGY_EXITS and underlying_key:
@@ -7745,7 +7814,7 @@ def check_exit_conditions(position, current_price, trader):
 
 def exit_position(trader, position_id, position, exit_price, reason):
     """Execute position exit and update tracking"""
-    global ACTIVE_POSITIONS, DAILY_PNL, CLOSED_POSITIONS, POSITION_PEAK_PRICES
+    global ACTIVE_POSITIONS, DAILY_PNL, CLOSED_POSITIONS, POSITION_PEAK_PRICES, POSITION_TRAILING_SL
     
     symbol = position.get('option_symbol') or position['symbol']
     quantity = position['quantity']
@@ -7833,6 +7902,8 @@ def exit_position(trader, position_id, position, exit_price, reason):
             # Clean up peak price tracking
             if position_id in POSITION_PEAK_PRICES:
                 del POSITION_PEAK_PRICES[position_id]
+            if position_id in POSITION_TRAILING_SL:
+                del POSITION_TRAILING_SL[position_id]
             
             print(f"{'='*120}\n")
             return True
@@ -8137,6 +8208,64 @@ def check_ha_reversal_alerts(access_token: str, trader=None):
         confirmed_str = "CONFIRMED ✅" if klinger_confirms else "UNCONFIRMED ⚠️ (HA flip only)"
         counter       = "SHORT/PE" if signal == 'LONG' else "LONG/CE"
         arrow         = "🔴" if signal == 'LONG' else "🟢"
+
+        # ── NEW: Check profit and trailing stop before auto‑exit ─────────────────
+        # Get current P&L % from the position (already updated by monitor_active_positions)
+        pnl_pct = position.get('pnl_percent', 0.0)
+        pos_abs_pnl = abs(pnl_pct)
+
+        # Minimum profit threshold: do not auto‑exit if profit is too small
+        HA_AUTO_EXIT_MIN_PROFIT_PCT = 10.0   # configurable, can be adjusted
+        if klinger_confirms and trader is not None and pos_abs_pnl < HA_AUTO_EXIT_MIN_PROFIT_PCT:
+            print(
+                f"\n⚡ HA reversal detected but AUTO-EXIT BLOCKED for {symbol} ({signal})\n"
+                f"   Reason: Profit {pnl_pct:+.1f}% < {HA_AUTO_EXIT_MIN_PROFIT_PCT}% minimum.\n"
+                f"   Flip will be logged but position will stay open."
+            )
+            # Still print the alert (so user sees it) but do NOT exit
+            print(
+                f"\n{'='*80}\n"
+                f"{arrow} HA REVERSAL ALERT — {symbol} | {signal} position\n"
+                f"{'='*80}\n"
+                f"   HA flip:       [{c_prev2}] → [{c_prev1}] → [{c_last}] "
+                f"(2 consecutive {c_last} candles)\n"
+                f"   Klinger:       {ko_desc}\n"
+                f"   Confirmation:  {confirmed_str}\n"
+                f"   Entry price:   ₹{entry_price:.2f} | Underlying LTP: ₹{underlying_ltp:.2f}\n"
+                f"   Current P&L:   {pnl_pct:+.1f}% (below minimum for auto-exit)\n"
+                f"   Suggestion:    Consider exiting {signal} / entering {counter} manually\n"
+                f"{'='*80}"
+            )
+            continue
+
+        # Block auto‑exit if trailing stop is active and drawdown is small
+        # We check: trailing stop active (profit >= TRAILING_STOP_ACTIVATION) AND
+        #            position has a peak price recorded, and drawdown from peak < trailing percentage.
+        HA_BLOCK_WHEN_TRAILING_ACTIVE = True
+        if HA_BLOCK_WHEN_TRAILING_ACTIVE and pnl_pct >= TRAILING_STOP_ACTIVATION and pos_id in POSITION_PEAK_PRICES:
+            peak = POSITION_PEAK_PRICES[pos_id]
+            # Drawdown from peak (percentage)
+            drawdown = (peak - current_price) / peak * 100 if current_price <= peak else 0.0
+            if drawdown < TRAILING_STOP_PERCENTAGE:
+                print(
+                    f"\n⚡ HA reversal detected but AUTO-EXIT BLOCKED for {symbol} ({signal})\n"
+                    f"   Reason: Trailing stop active (profit {pnl_pct:.1f}% >= {TRAILING_STOP_ACTIVATION}%),\n"
+                    f"           drawdown from peak {drawdown:.1f}% < {TRAILING_STOP_PERCENTAGE}% trail.\n"
+                    f"   Letting trailing stop manage exit instead."
+                )
+                # Still print the alert (so user sees it) but do NOT exit
+                print(
+                    f"\n{'='*80}\n"
+                    f"{arrow} HA REVERSAL ALERT — {symbol} | {signal} position\n"
+                    f"{'='*80}\n"
+                    f"   HA flip:       [{c_prev2}] → [{c_prev1}] → [{c_last}]\n"
+                    f"   Klinger:       {ko_desc}\n"
+                    f"   Confirmation:  {confirmed_str}\n"
+                    f"   Trailing stop active — auto-exit blocked (drawdown {drawdown:.1f}% < trail)\n"
+                    f"   Entry: ₹{entry_price:.2f} | Peak: ₹{peak:.2f} | Current: ₹{current_price:.2f}\n"
+                    f"{'='*80}"
+                )
+                continue
 
         # ── Enhancement 1: Auto-exit on confirmed flip ───────────────────────
         if klinger_confirms and trader is not None:
@@ -8446,7 +8575,7 @@ def verify_order_result(trader, result, symbol):
 def place_breakout_order(breakout_data, trader):
     """Place OPTION orders for R3/S3/Box/Range breakouts"""
     global DAILY_ORDER_COUNT, BOX_ORDER_COUNT, RANGE_ORDER_COUNT, LAST_ORDER_TIME
-    global PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED
+    global PLACED_ORDERS, ACTIVE_POSITIONS, TRADING_STOPPED, POSITION_TRAILING_SL
 
     if TRADING_STOPPED:
         print("⚡ Trading stopped - no new orders")
@@ -8579,6 +8708,7 @@ def place_breakout_order(breakout_data, trader):
                             print(f"✅ SL Order ID: {sl_order_id}")
                             PLACED_ORDERS[order_id]['sl_order_id'] = sl_order_id
                             ACTIVE_POSITIONS[order_id]['sl_order_id'] = sl_order_id
+                            POSITION_TRAILING_SL[order_id] = sl_trigger   # seed initial level
                 except Exception as e:
                     print(f"⚡ SL placement error: {e}")
 
@@ -8590,7 +8720,7 @@ def place_breakout_order(breakout_data, trader):
 
 def place_gap_order(gap_info, signal, trader):
     """Place OPTION orders for gap trading signals"""
-    global GAP_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS
+    global GAP_ORDER_COUNT, LAST_ORDER_TIME, PLACED_ORDERS, ACTIVE_POSITIONS, POSITION_TRAILING_SL
     global GAP_LEVELS, TRADING_STOPPED
 
     if TRADING_STOPPED:
@@ -8722,6 +8852,7 @@ def place_gap_order(gap_info, signal, trader):
                         if sl_order_id:
                             PLACED_ORDERS[order_id]['sl_order_id'] = sl_order_id
                             ACTIVE_POSITIONS[order_id]['sl_order_id'] = sl_order_id
+                            POSITION_TRAILING_SL[order_id] = sl_trigger   # seed initial level
                             print(f" ✅ SL Order: {sl_order_id}")
 
                     if target_result.get('status_code') == 200:
