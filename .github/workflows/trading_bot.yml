@@ -62,7 +62,10 @@ jobs:
 
       # ── 4. Install Python dependencies ──────────────────────────────────────
       - name: Install Python packages
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install scipy
+          pip install -r requirements.txt
 
       # ── 5. Restore candle cache ──────────────────────────────────────────────
       - name: Restore candle cache
