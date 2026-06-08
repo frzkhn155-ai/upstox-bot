@@ -2686,94 +2686,97 @@ def banner():
     print("="*120 + "\n")
 
 def verify_token(token, verbose=True):
-    """Verify API token and return validation status"""
+    """Verify API token and return validation status.
+
+    HTTP response codes from /v2/user/profile:
+      200 -> token valid
+      401 -> token expired / invalid  (only case that means bad token)
+      403 -> Upstox IP restriction (UDAPI1154) — the TOKEN IS VALID, but the
+             app has static-IP whitelisting enabled. Do NOT reject the token;
+             proceed and let order calls fail with their own 403 if needed.
+      other -> unexpected; warn but still proceed so OAuth token is not wasted.
+
+    JWT exp field (22:00 IST) is informational only — Upstox servers honour
+    tokens until ~03:30 IST next day. Never block on it.
+    """
     if verbose:
-        print("🔍 Verifying API token...")
+        print("\U0001f50d Verifying API token...")
 
-    # --- PRE-CHECK: Decode JWT expiry without making API call ---
+    # Soft JWT decode — informational only, never fatal
     try:
-        import base64, json as _json
-        parts = token.split('.')
+        import base64 as _b64, json as _json
+        parts = token.split(".")
         if len(parts) == 3:
-            payload_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
-            payload = _json.loads(base64.b64decode(payload_b64).decode('utf-8'))
-            exp_ts = payload.get('exp')
-            if exp_ts:
+            pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload = _json.loads(_b64.b64decode(pad).decode("utf-8"))
+            exp_ts = payload.get("exp")
+            if exp_ts and verbose:
                 exp_dt = datetime.fromtimestamp(exp_ts, tz=_IST).replace(tzinfo=None)
-                now = now_ist()
-                if now > exp_dt:
-                    print(f"🚨 TOKEN EXPIRED at {exp_dt.strftime('%Y-%m-%d %H:%M:%S')} — IT IS NOW {now.strftime('%H:%M:%S')} — ORDERS WILL FAIL!")
-                    print(f"   ➡ Set USE_HARDCODED_TOKEN=False to auto-login, or update HARDCODED_TOKEN")
+                mins_left = int((exp_dt - now_ist()).total_seconds() / 60)
+                hm = exp_dt.strftime("%H:%M")
+                now_hm = now_ist().strftime("%H:%M")
+                if mins_left < 0:
+                    print(f"\u26a0\ufe0f  JWT exp field: {hm} IST (now {now_hm}) "
+                          f"\u2014 Upstox servers stay live until ~03:30 IST; confirming via API...")
                 else:
-                    mins_left = int((exp_dt - now).total_seconds() / 60)
-                    if verbose:
-                        print(f"⏱ Token expires at {exp_dt.strftime('%H:%M:%S')} ({mins_left} min remaining)")
+                    print(f"\u23f1  JWT exp: {hm} IST ({mins_left} min remaining)")
     except Exception:
-        pass  # Don't block on JWT decode failure
-    # --- END PRE-CHECK ---
+        pass
 
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
     url = "https://api.upstox.com/v2/user/profile"
     try:
         response = _get_upstox_session(token).get(url, timeout=10)
+
         if response.status_code == 200:
             data = response.json()
             if verbose:
-                print("✅ Token is VALID")
-                if 'data' in data:
-                    user_name = data['data'].get('user_name', 'N/A')
-                    user_id = data['data'].get('user_id', 'N/A')
-                    print(f" User: {user_name} (ID: {user_id})\n")
-            return {
-                'valid': True,
-                'data': data.get('data', {}),
-                'message': 'Token is valid'
-            }
+                print("\u2705 Token is VALID")
+                if "data" in data:
+                    uname = data["data"].get("user_name", "N/A")
+                    uid   = data["data"].get("user_id", "N/A")
+                    print(f" User: {uname} (ID: {uid})\n")
+            return {"valid": True, "data": data.get("data", {}),
+                    "message": "Token is valid"}
+
         elif response.status_code == 401:
             if verbose:
-                print("❌ Token is INVALID or EXPIRED")
-            return {
-                'valid': False,
-                'message': 'Token is invalid or expired',
-                'status_code': 401
-            }
+                print("\u274c Token REJECTED by Upstox API (401) \u2014 needs fresh login")
+                print("   \u27a1 Update UPSTOX_TOKEN secret or re-run OAuth")
+            return {"valid": False, "message": "Token is invalid or expired",
+                    "status_code": 401}
+
+        elif response.status_code == 403:
+            # IP restriction (UDAPI1154): token is fine, IP is blocked.
+            # Bot proceeds normally; order calls will also get 403 until
+            # IP whitelisting is disabled in the Upstox developer portal.
+            if verbose:
+                print("\u2705 Token is VALID (profile blocked by Upstox IP restriction UDAPI1154)")
+                print("   \u26a0\ufe0f  To fix: disable static-IP whitelist at "
+                      "account.upstox.com/developer/apps")
+            return {"valid": True, "data": {},
+                    "message": "Token valid; IP restriction active (UDAPI1154)"}
+
         else:
             if verbose:
-                print(f"⚠️ Unexpected response: {response.status_code}")
-            return {
-                'valid': False,
-                'message': f'Unexpected status code: {response.status_code}',
-                'status_code': response.status_code
-            }
+                print(f"\u26a0\ufe0f  Unexpected response {response.status_code} from profile "
+                      f"API \u2014 proceeding with token anyway")
+            return {"valid": True, "data": {},
+                    "message": f"Unexpected status {response.status_code}; token assumed valid"}
+
     except requests.exceptions.Timeout:
         if verbose:
-            print("❌ Token verification timed out")
-        return {
-            'valid': False,
-            'message': 'Request timeout'
-        }
+            print("\u26a0\ufe0f  Token verification timed out \u2014 proceeding with token")
+        return {"valid": True, "data": {}, "message": "Verification timeout; token assumed valid"}
     except requests.exceptions.RequestException as e:
         if verbose:
-            print(f"❌ Token verification failed: {e}")
-        return {
-            'valid': False,
-            'message': f'Request failed: {str(e)}'
-        }
+            print(f"\u26a0\ufe0f  Token verification network error: {e} \u2014 proceeding")
+        return {"valid": True, "data": {}, "message": f"Network error: {e}; token assumed valid"}
     except Exception as e:
         if verbose:
-            print(f"❌ Token verification error: {e}")
-        return {
-            'valid': False,
-            'message': f'Verification error: {str(e)}'
-        }
+            print(f"\u26a0\ufe0f  Token verification unexpected error: {e} \u2014 proceeding")
+        return {"valid": True, "data": {}, "message": f"Error: {e}; token assumed valid"}
 
-# ============================================================================
-# FII/DII EXTRACTION AND ORB STRATEGY FUNCTIONS
-# ============================================================================
-# (These functions remain exactly as in original both4; they are not modified by the cache)
+
 def extract_fii_dii_data():
     global FII_DII_DATA, FII_DII_LAST_UPDATE, FII_DII_STRONG_BUY, FII_DII_STRONG_SELL, FII_DII_MIXED
     print(f"\n{'='*100}")
