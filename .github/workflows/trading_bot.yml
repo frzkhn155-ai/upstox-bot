@@ -1,14 +1,6 @@
 name: Upstox Trading Bot
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TRIGGERS
-#   • Schedule  : runs automatically at 09:10 IST (03:40 UTC) on weekdays
-#   • Manual    : Actions tab → "Upstox Trading Bot" → "Run workflow"
-# ─────────────────────────────────────────────────────────────────────────────
 on:
-  schedule:
-    - cron: '50 8 * * 1-5'   # 03:40 UTC = 09:10 IST, Mon–Fri only
-
   workflow_dispatch:
     inputs:
       reason:
@@ -37,9 +29,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── 3. Chrome — use pre-installed runner image; upgrade only if missing ─
-      #   GitHub-hosted Ubuntu runners ship with google-chrome-stable.
-      #   The fallback uses the modern gpg keyring approach (no apt-key).
+      # ── 3. Ensure Google Chrome is available ────────────────────────────────
       - name: Ensure Google Chrome is available
         run: |
           if command -v google-chrome &>/dev/null; then
@@ -91,7 +81,6 @@ jobs:
       # ── 7. Run the bot ───────────────────────────────────────────────────────
       - name: Run trading bot
         env:
-          # ── Upstox credentials ───────────────────────────────────────────────
           UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
           UPSTOX_PASSWORD:     ${{ secrets.UPSTOX_PASSWORD }}
           UPSTOX_MOBILE:       ${{ secrets.UPSTOX_MOBILE }}
@@ -99,17 +88,11 @@ jobs:
           UPSTOX_API_KEY:      ${{ secrets.UPSTOX_API_KEY }}
           UPSTOX_API_SECRET:   ${{ secrets.UPSTOX_API_SECRET }}
           UPSTOX_TOKEN:        ${{ secrets.UPSTOX_TOKEN }}
-
-          # ── Chartink cookies (refresh from browser when 5min data fails) ──────
           CHARTINK_XSRF:       ${{ secrets.CHARTINK_XSRF }}
           CHARTINK_SESSION:    ${{ secrets.CHARTINK_SESSION }}
-
-          # ── AI providers ─────────────────────────────────────────────────────
           GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
           GROQ_API_KEY_2:      ${{ secrets.GROQ_API_KEY_2 }}
           NVIDIA_API_KEY:      ${{ secrets.NVIDIA_API_KEY }}
-
-          # ── Timezone & display ───────────────────────────────────────────────
           TZ: Asia/Kolkata
           DISPLAY: ':99'
         run: |
@@ -154,7 +137,7 @@ jobs:
             orb_trading_log.txt
             cache_stats.json
 
-      # ── 10. Upload bot debug logs on failure ─────────────────────────────────
+      # ── 10. Upload debug logs on failure ─────────────────────────────────────
       - name: Upload debug logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
