@@ -328,6 +328,46 @@ ORB_MIN_CANDLE_BODY_SHORT = 0.6    # SHORT ORB: slightly higher body % required
 ORB_REQUIRE_STRONG_FII_FOR_MEDIUM_RSI = True  # If RSI borderline, require STRONG FII/DII
 
 # File paths for ORB logging
+# ========== SESSION-PHASE ENGINE CONFIG ==========
+# The trading day is split into 3 phases, each with its own strategy logic.
+#
+#  Phase 1 | 09:15–10:30 | MOMENTUM ORB     — pure breakout, fast confirmation
+#  Phase 2 | 10:30–13:00 | MIDDAY BOX       — detect tight consolidation range,
+#                                             trade the eventual breakout
+#  Phase 3 | 13:00–15:15 | AFTERNOON PIVOT  — R3/S3 rejection + VWAP + RSI gate
+#                                             catches European-session volatility
+#
+# All three phases share the same Klinger + FII/DII + exit management stack.
+
+# ── Phase 2: Midday Box ──────────────────────────────────────────────────────
+ENABLE_MIDDAY_BOX           = True
+MIDDAY_BOX_BUILD_START      = "10:30"   # start tracking the box
+MIDDAY_BOX_BUILD_END        = "13:00"   # box is "sealed" — breakout watch begins
+MIDDAY_BOX_MIN_RANGE_PCT    = 0.25      # ignore boxes tighter than 0.25% range (noise)
+MIDDAY_BOX_MAX_RANGE_PCT    = 2.5       # ignore boxes wider than 2.5% (no consolidation)
+MIDDAY_BOX_BREAKOUT_BUFFER  = 0.15      # price must clear box edge by 0.15% to confirm
+MIDDAY_BOX_VOLUME_MIN       = 1.4       # breakout candle volume ratio vs 20-bar avg
+MIDDAY_BOX_MAX_ORDERS       = 3         # max orders from midday box per day
+
+# ── Phase 3: Afternoon Pivot Reversal ────────────────────────────────────────
+ENABLE_AFTERNOON_PIVOT      = True
+AFTERNOON_SESSION_START     = "13:00"
+AFTERNOON_SESSION_END       = "15:15"
+AFTERNOON_R3_BAND_PCT       = 0.40      # within 0.4% of R3/S3 counts as "at level"
+AFTERNOON_RSI_OVERBOUGHT    = 65        # RSI threshold for R3 short signal
+AFTERNOON_RSI_OVERSOLD      = 35        # RSI threshold for S3 long signal
+AFTERNOON_VWAP_CONFIRM      = True      # require VWAP crossover confirmation
+AFTERNOON_REQUIRE_KLINGER   = False     # Klinger preferred but not mandatory (noon)
+AFTERNOON_MAX_ORDERS        = 3         # max orders from afternoon pivot per day
+AFTERNOON_RISK_REWARD_MIN   = 1.8       # minimum R:R to take the trade
+
+# File paths for new strategies
+MIDDAY_BOX_LOG_FILE         = "box_midday_alerts.csv"
+AFTERNOON_PIVOT_LOG_FILE    = "afternoon_pivot_alerts.csv"
+
+
+
+
 ORB_SIGNALS_FILE = "orb_signals.csv"
 ORB_TRADES_FILE = "orb_trades.csv"
 ORB_LOG_FILE = "orb_trading_log.txt"
@@ -454,6 +494,16 @@ FII_DII_TREND_LOCK                = threading.RLock()  # Thread safety
 # ORB GLOBALS
 ORB_CANDLES = {}
 ORB_SIGNALS = {}
+
+# ── Midday Box global state ───────────────────────────────────────────────────
+# keyed by symbol; each entry tracks the live consolidation range 10:30–13:00
+MIDDAY_BOX_STATE: dict = {}      # symbol → {box_high, box_low, candles, sealed}
+MIDDAY_BOX_ORDER_COUNT = 0
+MIDDAY_BOX_ALERTED: set = set()  # symbols that already traded via midday box today
+
+# ── Afternoon Pivot global state ──────────────────────────────────────────────
+AFTERNOON_ORDER_COUNT = 0
+AFTERNOON_ALERTED: set = set()   # symbols already traded via afternoon pivot today
 ORB_LATE_CHECKED = set()   # symbols confirmed zero-volume at 09:20; retry until volume appears
 ORB_ACTIVE_TRADES = {}
 ORB_ALERTED_STOCKS = set()   # fired ORB signal today
@@ -3566,6 +3616,12 @@ def check_orb_time_and_process(access_token, live_data):
 
     if current_time < "09:15":
         ORB_PROCESSED_TODAY = False
+        MIDDAY_BOX_STATE.clear()
+        MIDDAY_BOX_ALERTED.clear()
+        AFTERNOON_ALERTED.clear()
+        global MIDDAY_BOX_ORDER_COUNT, AFTERNOON_ORDER_COUNT
+        MIDDAY_BOX_ORDER_COUNT = 0
+        AFTERNOON_ORDER_COUNT  = 0
         ORB_LATE_CHECKED.clear()
 
     # ── PRIMARY PASS ─────────────────────────────────────────────────────────
@@ -9187,6 +9243,460 @@ def print_final_stats():
         f.write(f"{'='*100}\n\n")
 
 # ========== MAIN MONITORING LOOP ==========
+# ══════════════════════════════════════════════════════════════════════════════
+#  SESSION-PHASE ENGINE
+#  Phase 1 (09:15–10:30): ORB Momentum         ← already handled above
+#  Phase 2 (10:30–13:00): Midday Box Breakout
+#  Phase 3 (13:00–15:15): Afternoon Pivot Reversal (R3/S3 + VWAP + RSI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calculate_session_vwap(symbol, access_token, ikey):
+    """Compute session VWAP from merged hist+RT 5-min bars (09:15 onwards).
+
+    Uses fetch_5min_cached so data is available from market open.
+    Returns float or None.
+    """
+    try:
+        df = fetch_5min_cached(access_token, ikey, bars=80, symbol=symbol)
+        if df is None or len(df) < 3:
+            return None
+        # Filter to today's session only
+        today = now_ist().date()
+        df = df[pd.to_datetime(df['date']).dt.date == today].copy()
+        if df.empty:
+            return None
+        tp = (df['high'] + df['low'] + df['close']) / 3.0
+        vol = df['volume'].clip(lower=0)
+        total_vol = vol.sum()
+        return float((tp * vol).sum() / total_vol) if total_vol > 0 else None
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⚠️ VWAP calc error {symbol}: {e}")
+        return None
+
+
+def update_midday_box_state(live_data):
+    """Track high/low of every symbol during 10:30–13:00 consolidation window.
+
+    Called every scan during Phase 2.  Stores per-symbol box in MIDDAY_BOX_STATE.
+    """
+    global MIDDAY_BOX_STATE
+    ct = now_ist()
+    for ikey, data in live_data.items():
+        symbol = ISIN_TO_SYMBOL.get(ikey, ikey)
+        ltp = data.get('ltp', 0)
+        if ltp <= 0:
+            continue
+        state = MIDDAY_BOX_STATE.get(symbol)
+        if state is None:
+            MIDDAY_BOX_STATE[symbol] = {
+                'box_high': ltp, 'box_low': ltp,
+                'candles': 1, 'sealed': False, 'start': ct
+            }
+        elif not state['sealed']:
+            state['box_high'] = max(state['box_high'], ltp)
+            state['box_low']  = min(state['box_low'],  ltp)
+            state['candles'] += 1
+
+
+def check_midday_box_breakout(symbol, ltp, volume, live_data):
+    """Detect breakout from the 10:30–13:00 consolidation box after 13:00.
+
+    Returns a signal dict or None.
+    """
+    global MIDDAY_BOX_STATE, MIDDAY_BOX_ORDER_COUNT, MIDDAY_BOX_ALERTED
+
+    if not ENABLE_MIDDAY_BOX:
+        return None
+    if MIDDAY_BOX_ORDER_COUNT >= MIDDAY_BOX_MAX_ORDERS:
+        return None
+    if symbol in MIDDAY_BOX_ALERTED:
+        return None
+
+    state = MIDDAY_BOX_STATE.get(symbol)
+    if not state or state['candles'] < 4:   # need at least 4 datapoints to form a box
+        return None
+
+    box_high = state['box_high']
+    box_low  = state['box_low']
+    box_range_pct = (box_high - box_low) / box_low * 100
+
+    # Filter out boxes that are too tight (noise) or too wide (no consolidation)
+    if box_range_pct < MIDDAY_BOX_MIN_RANGE_PCT or box_range_pct > MIDDAY_BOX_MAX_RANGE_PCT:
+        if DEBUG_MODE:
+            print(f"⛔ Midday box {symbol}: range {box_range_pct:.2f}% outside "
+                  f"[{MIDDAY_BOX_MIN_RANGE_PCT},{MIDDAY_BOX_MAX_RANGE_PCT}]%")
+        return None
+
+    # Breakout: price clears box edge by buffer
+    buffer_up   = box_high * (1 + MIDDAY_BOX_BREAKOUT_BUFFER / 100)
+    buffer_down = box_low  * (1 - MIDDAY_BOX_BREAKOUT_BUFFER / 100)
+
+    if ltp > buffer_up:
+        direction = 'BUY'
+    elif ltp < buffer_down:
+        direction = 'SELL'
+    else:
+        return None     # still inside box
+
+    # Volume confirmation
+    avg_vol = (VOLUME_DATA.get(symbol, {}).get('avg_volume') or
+               VOLUME_DATA.get(symbol, {}).get('avg_vol_20d') or
+               live_data.get('avg_volume', 0))
+    vol_ratio = volume / avg_vol if avg_vol > 0 else 0
+    if avg_vol > 0 and vol_ratio < MIDDAY_BOX_VOLUME_MIN:
+        if DEBUG_MODE:
+            print(f"⛔ Midday box {symbol}: vol ratio {vol_ratio:.2f} < {MIDDAY_BOX_VOLUME_MIN}")
+        return None
+
+    # FII/DII alignment
+    fii_signal = get_fii_dii_signal(symbol)
+    if direction == 'BUY'  and fii_signal in ('STRONG_SELL', 'SELL'):
+        if DEBUG_MODE:
+            print(f"⛔ Midday box {symbol}: BUY blocked by FII/DII={fii_signal}")
+        return None
+    if direction == 'SELL' and fii_signal in ('STRONG_BUY', 'BUY'):
+        if DEBUG_MODE:
+            print(f"⛔ Midday box {symbol}: SELL blocked by FII/DII={fii_signal}")
+        return None
+
+    # Build signal
+    if direction == 'BUY':
+        stop   = box_low  * 0.997
+        risk   = ltp - stop
+        target = ltp + 2.0 * risk if risk > 0 else ltp * 1.01
+    else:
+        stop   = box_high * 1.003
+        risk   = stop - ltp
+        target = ltp - 2.0 * risk if risk > 0 else ltp * 0.99
+
+    MIDDAY_BOX_ALERTED.add(symbol)
+
+    return {
+        'symbol':       symbol,
+        'signal':       'MIDDAY_BOX_BREAKOUT',
+        'direction':    direction,
+        'entry_price':  ltp,
+        'stop_loss':    stop,
+        'target':       target,
+        'box_high':     box_high,
+        'box_low':      box_low,
+        'box_range_pct': box_range_pct,
+        'volume_ratio': vol_ratio,
+        'fii_dii':      fii_signal,
+        'timestamp':    now_ist(),
+    }
+
+
+def check_afternoon_pivot_reversal(symbol, ltp, access_token, ikey, trader=None):
+    """Afternoon R3/S3 pivot reversal (13:00–15:15).
+
+    Entry logic (mirroring the blueprint):
+      SHORT: price >= R3 AND RSI >= AFTERNOON_RSI_OVERBOUGHT
+             AND (VWAP confirm OFF or ltp < VWAP) — momentum exhausting at R3
+      LONG:  price <= S3 AND RSI <= AFTERNOON_RSI_OVERSOLD
+             AND (VWAP confirm OFF or ltp > VWAP) — buyers reclaiming S3
+
+    Secondary gate: Klinger turning in the trade direction (if enabled).
+    Returns signal dict or None.
+    """
+    global AFTERNOON_ORDER_COUNT, AFTERNOON_ALERTED
+
+    if not ENABLE_AFTERNOON_PIVOT:
+        return None
+    if AFTERNOON_ORDER_COUNT >= AFTERNOON_MAX_ORDERS:
+        return None
+    if symbol in AFTERNOON_ALERTED:
+        return None
+
+    info = R3_LEVELS.get(ikey, {})
+    if not info:
+        return None
+
+    r3    = info.get('r3')
+    s3    = info.get('s3')
+    pivot = info.get('pivot')
+    if r3 is None or s3 is None:
+        return None
+
+    # Price proximity to R3 or S3
+    dist_r3_pct = (ltp - r3) / r3 * 100   # positive = above R3
+    dist_s3_pct = (s3 - ltp) / s3 * 100   # positive = below S3
+
+    at_r3 = dist_r3_pct >= 0 and abs(dist_r3_pct) <= AFTERNOON_R3_BAND_PCT
+    at_s3 = dist_s3_pct >= 0 and abs(dist_s3_pct) <= AFTERNOON_R3_BAND_PCT
+
+    if not at_r3 and not at_s3:
+        if DEBUG_MODE:
+            print(f"⛔ Afternoon pivot {symbol}: not near R3({r3:.2f}) or S3({s3:.2f}) "
+                  f"— ltp={ltp:.2f}")
+        return None
+
+    # RSI gate
+    try:
+        df = fetch_5min_cached(access_token, ikey, bars=60, symbol=symbol)
+        if df is None or len(df) < 15:
+            if DEBUG_MODE:
+                print(f"⛔ Afternoon pivot {symbol}: insufficient bars for RSI")
+            return None
+        rsi = calculate_rsi(df, period=14)
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⛔ Afternoon pivot {symbol}: RSI error {e}")
+        return None
+
+    # VWAP
+    vwap = calculate_session_vwap(symbol, access_token, ikey) if AFTERNOON_VWAP_CONFIRM else None
+
+    # Klinger
+    klinger_info = info.get('klinger')
+    ko = klinger_info.get('klinger', 0) if klinger_info else 0
+    ko_prev = klinger_info.get('klinger_prev', 0) if klinger_info else 0
+    klinger_bearish = ko < ko_prev   # falling = bearish
+    klinger_bullish = ko > ko_prev   # rising  = bullish
+
+    direction = None
+
+    if at_r3 and rsi is not None and rsi >= AFTERNOON_RSI_OVERBOUGHT:
+        # SHORT setup: price stretched to R3, RSI overbought
+        vwap_ok = (not AFTERNOON_VWAP_CONFIRM or vwap is None or ltp < vwap)
+        klinger_ok = (not AFTERNOON_REQUIRE_KLINGER or klinger_bearish)
+        if vwap_ok and klinger_ok:
+            direction = 'SELL'
+        elif DEBUG_MODE:
+            print(f"⛔ Afternoon pivot {symbol} R3 SHORT: "
+                  f"VWAP_ok={vwap_ok}(ltp={ltp:.1f} vwap={vwap}), "
+                  f"Klinger_ok={klinger_ok}(KO={ko:.0f}↓={klinger_bearish})")
+
+    elif at_s3 and rsi is not None and rsi <= AFTERNOON_RSI_OVERSOLD:
+        # LONG setup: price exhausted at S3, RSI oversold
+        vwap_ok = (not AFTERNOON_VWAP_CONFIRM or vwap is None or ltp > vwap)
+        klinger_ok = (not AFTERNOON_REQUIRE_KLINGER or klinger_bullish)
+        if vwap_ok and klinger_ok:
+            direction = 'BUY'
+        elif DEBUG_MODE:
+            print(f"⛔ Afternoon pivot {symbol} S3 LONG: "
+                  f"VWAP_ok={vwap_ok}(ltp={ltp:.1f} vwap={vwap}), "
+                  f"Klinger_ok={klinger_ok}(KO={ko:.0f}↑={klinger_bullish})")
+
+    if direction is None:
+        return None
+
+    # FII/DII alignment
+    fii_signal = get_fii_dii_signal(symbol)
+    if direction == 'SELL' and fii_signal in ('STRONG_BUY', 'BUY'):
+        if DEBUG_MODE:
+            print(f"⛔ Afternoon pivot {symbol}: SELL blocked by FII/DII={fii_signal}")
+        return None
+    if direction == 'BUY' and fii_signal in ('STRONG_SELL', 'SELL'):
+        if DEBUG_MODE:
+            print(f"⛔ Afternoon pivot {symbol}: BUY blocked by FII/DII={fii_signal}")
+        return None
+
+    # Risk/reward
+    last_candle = df.iloc[-1]
+    if direction == 'SELL':
+        stop   = last_candle['high'] * 1.003
+        risk   = stop - ltp
+        target = ltp - AFTERNOON_RISK_REWARD_MIN * risk if risk > 0 else ltp * 0.985
+    else:
+        stop   = last_candle['low'] * 0.997
+        risk   = ltp - stop
+        target = ltp + AFTERNOON_RISK_REWARD_MIN * risk if risk > 0 else ltp * 1.015
+
+    if risk <= 0:
+        return None
+
+    rr = abs(target - ltp) / risk
+
+    # Confidence
+    if fii_signal in ('STRONG_BUY', 'STRONG_SELL'):
+        confidence = 'VERY_HIGH'
+    elif fii_signal in ('BUY', 'SELL'):
+        confidence = 'HIGH'
+    else:
+        confidence = 'MEDIUM'
+
+    AFTERNOON_ALERTED.add(symbol)
+
+    return {
+        'symbol':       symbol,
+        'signal':       'AFTERNOON_R3_SHORT' if direction == 'SELL' else 'AFTERNOON_S3_LONG',
+        'direction':    direction,
+        'entry_price':  ltp,
+        'stop_loss':    stop,
+        'target':       target,
+        'risk_reward':  rr,
+        'r3':           r3,
+        's3':           s3,
+        'pivot':        pivot,
+        'rsi':          rsi,
+        'vwap':         vwap,
+        'klinger':      ko,
+        'fii_dii':      fii_signal,
+        'confidence':   confidence,
+        'timestamp':    now_ist(),
+    }
+
+
+def send_afternoon_pivot_alert(signal, trader=None):
+    """Log + optionally trade an afternoon pivot signal."""
+    global AFTERNOON_ORDER_COUNT
+
+    s   = signal['symbol']
+    sig = signal['signal']
+    d   = signal['direction']
+    ep  = signal['entry_price']
+    sl  = signal['stop_loss']
+    tgt = signal['target']
+    rr  = signal['risk_reward']
+    rsi = signal.get('rsi', 0)
+    vwap = signal.get('vwap')
+    r3  = signal.get('r3', 0)
+    s3  = signal.get('s3', 0)
+
+    print(f"\n{'='*80}")
+    print(f"🌆 AFTERNOON PIVOT ALERT: {sig}")
+    print(f"{'='*80}")
+    print(f"Stock: {s} | Direction: {d} | Time: {now_ist().strftime('%H:%M:%S')}")
+    print(f"Entry: ₹{ep:.2f} | Stop: ₹{sl:.2f} | Target: ₹{tgt:.2f} | R:R {rr:.1f}x")
+    print(f"R3: ₹{r3:.2f} | S3: ₹{s3:.2f} | RSI: {rsi:.1f}"
+          + (f" | VWAP: ₹{vwap:.2f}" if vwap else ""))
+    print(f"FII/DII: {signal.get('fii_dii')} | Confidence: {signal.get('confidence')}")
+    print(f"{'='*80}")
+
+    # CSV log
+    try:
+        import csv as _csv
+        file_exists = os.path.exists(AFTERNOON_PIVOT_LOG_FILE)
+        with open(AFTERNOON_PIVOT_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+            w = _csv.writer(f)
+            if not file_exists:
+                w.writerow(['Timestamp','Symbol','Signal','Direction','Entry',
+                            'Stop','Target','RR','RSI','VWAP','R3','S3',
+                            'FII_DII','Confidence'])
+            w.writerow([now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                        s, sig, d, ep, sl, tgt, f"{rr:.2f}",
+                        f"{rsi:.1f}", f"{vwap:.2f}" if vwap else '',
+                        f"{r3:.2f}", f"{s3:.2f}",
+                        signal.get('fii_dii'), signal.get('confidence')])
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⚠️ Afternoon pivot CSV log error: {e}")
+
+    # Place order (CE for LONG, PE for SELL)
+    if trader and is_order_time_allowed():
+        try:
+            option_type = 'CE' if d == 'BUY' else 'PE'
+            order_result = place_option_order(
+                trader, s, ep, option_type,
+                strategy_tag='AFTERNOON_PIVOT',
+                signal_confidence=signal.get('confidence', 'HIGH')
+            )
+            if order_result:
+                AFTERNOON_ORDER_COUNT += 1
+        except Exception as e:
+            print(f"⚠️ Afternoon pivot order error for {s}: {e}")
+
+
+def send_midday_box_alert(signal, trader=None):
+    """Log + optionally trade a midday box breakout signal."""
+    global MIDDAY_BOX_ORDER_COUNT
+
+    s  = signal['symbol']
+    d  = signal['direction']
+    ep = signal['entry_price']
+    sl = signal['stop_loss']
+    tgt = signal['target']
+    br = signal['box_range_pct']
+
+    print(f"\n{'='*80}")
+    print(f"📦 MIDDAY BOX BREAKOUT: {s} — {d}")
+    print(f"{'='*80}")
+    print(f"Entry: ₹{ep:.2f} | Stop: ₹{sl:.2f} | Target: ₹{tgt:.2f}")
+    print(f"Box: ₹{signal['box_low']:.2f}–₹{signal['box_high']:.2f} "
+          f"({br:.2f}% range) | Vol: {signal['volume_ratio']:.2f}x | FII/DII: {signal['fii_dii']}")
+    print(f"{'='*80}")
+
+    try:
+        import csv as _csv
+        file_exists = os.path.exists(MIDDAY_BOX_LOG_FILE)
+        with open(MIDDAY_BOX_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+            w = _csv.writer(f)
+            if not file_exists:
+                w.writerow(['Timestamp','Symbol','Direction','Entry','Stop','Target',
+                            'BoxHigh','BoxLow','RangePct','VolRatio','FII_DII'])
+            w.writerow([now_ist().strftime('%Y-%m-%d %H:%M:%S'),
+                        s, d, ep, sl, tgt,
+                        f"{signal['box_high']:.2f}", f"{signal['box_low']:.2f}",
+                        f"{br:.2f}", f"{signal['volume_ratio']:.2f}", signal['fii_dii']])
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"⚠️ Midday box CSV log error: {e}")
+
+    if trader and is_order_time_allowed():
+        try:
+            option_type = 'CE' if d == 'BUY' else 'PE'
+            order_result = place_option_order(
+                trader, s, ep, option_type,
+                strategy_tag='MIDDAY_BOX',
+                signal_confidence='HIGH'
+            )
+            if order_result:
+                MIDDAY_BOX_ORDER_COUNT += 1
+        except Exception as e:
+            print(f"⚠️ Midday box order error for {s}: {e}")
+
+
+def monitor_session_phase(live_data, access_token, trader=None):
+    """Dispatcher: routes to the correct strategy based on current session phase.
+
+    Phase 1 (09:15–10:30): ORB — handled separately in enhanced_monitor
+    Phase 2 (10:30–13:00): Midday Box — build the box and fire breakouts
+    Phase 3 (13:00–15:15): Afternoon Pivot — R3/S3 + VWAP + RSI reversals
+    """
+    ct     = now_ist()
+    ct_str = ct.strftime('%H:%M')
+
+    # ── Phase 2: Midday Box ───────────────────────────────────────────────────
+    if ENABLE_MIDDAY_BOX and MIDDAY_BOX_BUILD_START <= ct_str < MIDDAY_BOX_BUILD_END:
+        update_midday_box_state(live_data)
+        if DEBUG_MODE:
+            sealed_ct = sum(1 for s in MIDDAY_BOX_STATE.values() if s.get('sealed'))
+            print(f"📦 Midday box: tracking {len(MIDDAY_BOX_STATE)} symbols "
+                  f"(sealed={sealed_ct})")
+
+    elif ENABLE_MIDDAY_BOX and MIDDAY_BOX_BUILD_END <= ct_str < AFTERNOON_SESSION_START:
+        # Seal all open boxes
+        for sym_state in MIDDAY_BOX_STATE.values():
+            sym_state['sealed'] = True
+        # Check for breakouts
+        for ikey, data in live_data.items():
+            symbol = ISIN_TO_SYMBOL.get(ikey, ikey)
+            ltp    = data.get('ltp', 0)
+            volume = data.get('volume', 0)
+            if ltp > 0:
+                sig = check_midday_box_breakout(symbol, ltp, volume, data)
+                if sig:
+                    send_midday_box_alert(sig, trader)
+
+    # ── Phase 3: Afternoon Pivot ─────────────────────────────────────────────
+    elif ENABLE_AFTERNOON_PIVOT and AFTERNOON_SESSION_START <= ct_str <= AFTERNOON_SESSION_END:
+        for ikey, data in live_data.items():
+            symbol = ISIN_TO_SYMBOL.get(ikey, ikey)
+            ltp    = data.get('ltp', 0)
+            if ltp <= 0:
+                continue
+            try:
+                sig = check_afternoon_pivot_reversal(
+                    symbol, ltp, access_token, ikey, trader)
+                if sig:
+                    send_afternoon_pivot_alert(sig, trader)
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"⚠️ Afternoon pivot error {symbol}: {e}")
+
+
 def enhanced_monitor(access_token, keys, symbols):
     """Main monitoring loop with all strategies including Klinger, Caching, and Exit Management"""
     print("📡 STARTING REAL-TIME MONITORING WITH INTELLIGENT CACHING...")
@@ -9316,7 +9826,17 @@ def enhanced_monitor(access_token, keys, symbols):
             clear_intraday_cache()
             
             # Heartbeat - always visible so you know the bot is alive
-            print(f"\n🔄 Scan #{scan_count} | {current_time.strftime('%H:%M:%S')} | Orders today: {DAILY_ORDER_COUNT+BOX_ORDER_COUNT+RANGE_ORDER_COUNT+GAP_ORDER_COUNT+FAST_TRADE_ORDER_COUNT+ORB_ORDER_COUNT}", flush=True)
+            # Determine active session phase for heartbeat
+            _ct_str = current_time.strftime('%H:%M')
+            if _ct_str < "10:30":
+                _phase = "🔵 ORB"
+            elif _ct_str < "13:00":
+                _phase = "📦 MIDDAY-BOX"
+            elif _ct_str <= "15:15":
+                _phase = "🌆 AFTERNOON-PIVOT"
+            else:
+                _phase = "🔒 POST-MARKET"
+            print(f"\n🔄 Scan #{scan_count} | {current_time.strftime('%H:%M:%S')} | {_phase} | Orders today: {DAILY_ORDER_COUNT+BOX_ORDER_COUNT+RANGE_ORDER_COUNT+GAP_ORDER_COUNT+FAST_TRADE_ORDER_COUNT+ORB_ORDER_COUNT}", flush=True)
             
             # Check if trading should be stopped
             if TRADING_STOPPED:
@@ -9445,7 +9965,10 @@ def enhanced_monitor(access_token, keys, symbols):
                     time.sleep(10)
                     continue
                 
-                # Check ORB time and process if needed
+                # ── Session-phase strategy dispatcher ───────────────
+                monitor_session_phase(live_data, access_token, trader)
+
+                # Check ORB time and process if needed (Phase 1: 09:15–10:30)
                 if ENABLE_ORB_STRATEGY:
                     check_orb_time_and_process(access_token, live_data)
                     monitor_orb_breakouts(live_data, trader)
