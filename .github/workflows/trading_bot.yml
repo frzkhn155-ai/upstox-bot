@@ -116,10 +116,13 @@ jobs:
                    exits_log.csv exits_log.txt \
                    positions_tracking.csv \
                    fast_trades_entries.csv fast_trades_exits.csv \
+                   fii_dii_cache.json fii_dii_trend_cache.json \
                    crash_log.txt; do
             [ -f "$f" ] && git add -f "$f"
           done
           # Only commit if there are staged changes
+          # Also stage wildcard FII daily CSVs
+          git add -f FII_DII_*.csv 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "ℹ️  No log files changed — skipping commit."
           else
@@ -163,6 +166,9 @@ jobs:
             orb_trades.csv
             orb_trading_log.txt
             cache_stats.json
+            fii_dii_cache.json
+            fii_dii_trend_cache.json
+            FII_DII_*.csv
 
       # ── 10. Upload debug logs on failure ─────────────────────────────────────
       - name: Upload debug logs (on failure)
