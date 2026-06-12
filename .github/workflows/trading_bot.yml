@@ -100,6 +100,33 @@ jobs:
           sleep 2
           python Both4withcache10_headless.py
 
+
+      # ── Commit trading logs to repo ───────────────────────────────────────
+      - name: Commit trading logs to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Stage all log/CSV files that exist (ignore missing ones)
+          for f in orb_signals.csv orb_trades.csv orb_trading_log.txt \
+                   r3_live_alerts.csv r3_live_alerts.txt \
+                   gap_trading_alerts.csv gap_trading_alerts.txt \
+                   box_trading_alerts.csv box_trading_alerts.txt \
+                   range_trading_alerts.csv range_trading_alerts.txt \
+                   exits_log.csv exits_log.txt \
+                   positions_tracking.csv \
+                   fast_trades_entries.csv fast_trades_exits.csv \
+                   crash_log.txt; do
+            [ -f "$f" ] && git add -f "$f"
+          done
+          # Only commit if there are staged changes
+          if git diff --staged --quiet; then
+            echo "ℹ️  No log files changed — skipping commit."
+          else
+            git commit -m "logs: trading session $(date +'%Y-%m-%d') [run ${{ github.run_id }}]"
+            git push
+            echo "✅ Logs committed and pushed."
+          fi
       # ── 8. Save updated token for next run ───────────────────────────────────
       - name: Save Upstox token (post-run)
         if: always()
@@ -147,3 +174,4 @@ jobs:
           path: |
             logs/
             *.log
+
