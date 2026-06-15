@@ -1,6 +1,19 @@
 name: Upstox Trading Bot
 
+# ─────────────────────────────────────────────────────────────────────────────
+# upstox-bot uses its OWN Upstox API credentials (separate app from Final).
+# It manages its own token independently — it does NOT share tokens with
+# frzkhn155-ai/Final or frzkhn155-ai/Final-ORB-Only.
+#
+# Token flow:
+#   1. Read UPSTOX_TOKEN secret (set by previous run's self-sync)
+#   2. If expired/missing → Selenium OAuth with this repo's credentials
+#   3. After run → write fresh token back to THIS repo's UPSTOX_TOKEN secret
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
+  schedule:
+    - cron: '59 3 * * 1-5'    # 09:29 IST Mon–Fri (14 min after Final starts)
   workflow_dispatch:
     inputs:
       reason:
@@ -9,6 +22,7 @@ on:
         default: 'Manual trigger'
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   TZ: Asia/Kolkata
 
 jobs:
@@ -29,56 +43,68 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── 3. Ensure Google Chrome is available ────────────────────────────────
-      - name: Ensure Google Chrome is available
+      # ── 3. System dependencies ───────────────────────────────────────────────
+      - name: Install system dependencies
         run: |
-          if command -v google-chrome &>/dev/null; then
-            echo "✅ Chrome already installed — skipping download"
-            google-chrome --version
-          else
-            echo "⚠️  Chrome not found — installing via signed keyring"
-            wget -q -O /tmp/google-chrome.gpg \
-              https://dl.google.com/linux/linux_signing_key.pub
-            sudo gpg --dearmor \
-              -o /usr/share/keyrings/google-chrome.gpg \
-              /tmp/google-chrome.gpg
-            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
-              http://dl.google.com/linux/chrome/deb/ stable main" \
-              | sudo tee /etc/apt/sources.list.d/google-chrome.list
-            sudo apt-get update -q
-            sudo apt-get install -y google-chrome-stable
-            google-chrome --version
-          fi
+          sudo apt-get update -q
+          sudo apt-get install -y xclip xdotool xvfb
 
-      # ── 4. Install Python dependencies ──────────────────────────────────────
+      # ── 4. Google Chrome (modern signed-keyring method) ──────────────────────
+      - name: Install Google Chrome
+        run: |
+          sudo install -m 0755 -d /etc/apt/keyrings
+          wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+          sudo chmod a+r /etc/apt/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] \
+            http://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list > /dev/null
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      # ── 5. Install Python dependencies ──────────────────────────────────────
       - name: Install Python packages
         run: |
           pip install --upgrade pip
           pip install scipy
           pip install -r requirements.txt
 
-      # ── 5. Restore candle cache ──────────────────────────────────────────────
+      # ── 6. Restore candle cache ──────────────────────────────────────────────
       - name: Restore candle cache
         uses: actions/cache@v4
         with:
           path: candle_cache/
-          key: candle-cache-${{ runner.os }}-${{ github.run_id }}
+          key: candle-cache-upstox-bot-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            candle-cache-${{ runner.os }}-
+            candle-cache-upstox-bot-${{ runner.os }}-
 
-      # ── 6. Restore saved token ───────────────────────────────────────────────
-      - name: Restore Upstox token
+      # ── 7. Restore this repo's own token cache ───────────────────────────────
+      # NOTE: uses a SEPARATE cache key from Final/Final-ORB-Only so there is
+      # zero risk of accidentally loading a token from a different API app.
+      - name: Restore Upstox token (upstox-bot own cache)
         uses: actions/cache@v4
         with:
           path: |
             upstox_token.txt
             upstox_refresh_token.txt
             token_timestamp.json
-          key: upstox-token-${{ runner.os }}
+          key: upstox-token-upstox-bot-${{ runner.os }}
           restore-keys: |
-            upstox-token-${{ runner.os }}
+            upstox-token-upstox-bot-${{ runner.os }}
 
-      # ── 7. Run the bot ───────────────────────────────────────────────────────
+      # ── 8. Validate token secret ─────────────────────────────────────────────
+      - name: Validate Upstox token secret
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+        run: |
+          if [ -z "$UPSTOX_TOKEN" ]; then
+            echo "⚠️  UPSTOX_TOKEN secret is empty — bot will do Selenium OAuth"
+          else
+            echo "✅ UPSTOX_TOKEN is set (len=${#UPSTOX_TOKEN})"
+          fi
+
+      # ── 9. Run the bot ───────────────────────────────────────────────────────
       - name: Run trading bot
         env:
           UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
@@ -93,21 +119,84 @@ jobs:
           GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
           GROQ_API_KEY_2:      ${{ secrets.GROQ_API_KEY_2 }}
           NVIDIA_API_KEY:      ${{ secrets.NVIDIA_API_KEY }}
-          TZ: Asia/Kolkata
+          GH_TOKEN:            ${{ secrets.GH_PAT }}
           DISPLAY: ':99'
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
-          python Both4withcache10_headless.py
 
+          # ── Self-sync: push fresh token back to THIS repo only ──────────────
+          # Runs in the background, polls every 20s for up to 10 min.
+          # The moment the bot writes a fresh token, it's saved back to
+          # frzkhn155-ai/upstox-bot's UPSTOX_TOKEN secret for tomorrow's run.
+          # Final and Final-ORB-Only are deliberately EXCLUDED.
+          (
+            LAST=""
+            for i in $(seq 1 30); do
+              sleep 20
+              if [ -s upstox_token.txt ]; then
+                CURRENT=$(cat upstox_token.txt | tr -d '[:space:]')
+                if [ ${#CURRENT} -gt 450 ] && [ "$CURRENT" != "$LAST" ]; then
+                  LAST="$CURRENT"
+                  echo "[self-sync] New token detected (len=${#CURRENT})"
+                  if [ -n "$GH_TOKEN" ]; then
+                    gh secret set UPSTOX_TOKEN --body "$CURRENT" \
+                      --repo frzkhn155-ai/upstox-bot 2>&1 | sed 's/^/[self-sync] /'
+                    echo "[self-sync] ✅ UPSTOX_TOKEN saved to upstox-bot at $(TZ='Asia/Kolkata' date '+%H:%M:%S') IST"
+                  else
+                    echo "[self-sync] ⚠️  GH_PAT not set — add it to secrets to enable self-sync"
+                  fi
+                fi
+              fi
+            done
+          ) &
+          SYNC_PID=$!
 
-      # ── Commit trading logs to repo ───────────────────────────────────────
+          python - <<'PYEOF'
+          import traceback, sys, runpy
+          try:
+              runpy.run_path("Both4withcache10_headless.py", run_name="__main__")
+          except SystemExit as e:
+              sys.exit(e.code)
+          except Exception:
+              tb = traceback.format_exc()
+              print("❌ UNHANDLED EXCEPTION:\n" + tb, file=sys.stderr)
+              with open("crash_log.txt", "w") as f:
+                  f.write(tb)
+              sys.exit(1)
+          PYEOF
+
+          kill $SYNC_PID 2>/dev/null || true
+
+      # ── 10. End-of-day self-sync (safety net) ────────────────────────────────
+      - name: Save token to upstox-bot secret (end-of-day)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️  GH_PAT not set — cannot self-sync token."
+            echo "   Add GH_PAT (repo scope) to upstox-bot secrets to enable."
+            exit 0
+          fi
+          TOKEN_VALUE=""
+          if [ -f upstox_token.txt ]; then
+            TOKEN_VALUE=$(cat upstox_token.txt | tr -d '[:space:]')
+          fi
+          if [ -z "$TOKEN_VALUE" ]; then
+            echo "⚠️  upstox_token.txt empty — nothing to sync."
+            exit 0
+          fi
+          echo "✅ End-of-day self-sync: token (len=${#TOKEN_VALUE}) → upstox-bot"
+          gh secret set UPSTOX_TOKEN --body "$TOKEN_VALUE" --repo frzkhn155-ai/upstox-bot
+          echo "✅ Done. Final and Final-ORB-Only are NOT updated (different API app)."
+
+      # ── 11. Commit trading logs to repo ──────────────────────────────────────
       - name: Commit trading logs to repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Stage all log/CSV files that exist (ignore missing ones)
           for f in orb_signals.csv orb_trades.csv orb_trading_log.txt \
                    r3_live_alerts.csv r3_live_alerts.txt \
                    gap_trading_alerts.csv gap_trading_alerts.txt \
@@ -120,18 +209,17 @@ jobs:
                    crash_log.txt; do
             [ -f "$f" ] && git add -f "$f"
           done
-          # Only commit if there are staged changes
-          # Also stage wildcard FII daily CSVs
           git add -f FII_DII_*.csv 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "ℹ️  No log files changed — skipping commit."
           else
             git commit -m "logs: trading session $(date +'%Y-%m-%d') [run ${{ github.run_id }}]"
             git push
-            echo "✅ Logs committed and pushed."
+            echo "✅ Logs committed."
           fi
-      # ── 8. Save updated token for next run ───────────────────────────────────
-      - name: Save Upstox token (post-run)
+
+      # ── 12. Save token cache for next run ────────────────────────────────────
+      - name: Save Upstox token cache (post-run)
         if: always()
         uses: actions/cache@v4
         with:
@@ -139,45 +227,29 @@ jobs:
             upstox_token.txt
             upstox_refresh_token.txt
             token_timestamp.json
-          key: upstox-token-${{ runner.os }}
+          key: upstox-token-upstox-bot-${{ runner.os }}
 
-      # ── 9. Upload all log/CSV files as artifacts ─────────────────────────────
+      # ── 13. Upload trading logs as artifacts ─────────────────────────────────
       - name: Upload trading logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trading-logs-${{ github.run_id }}
           retention-days: 30
+          if-no-files-found: warn
           path: |
+            crash_log.txt
             r3_live_alerts.txt
             r3_live_alerts.csv
-            gap_trading_alerts.txt
             gap_trading_alerts.csv
-            box_trading_alerts.txt
             box_trading_alerts.csv
-            range_trading_alerts.txt
             range_trading_alerts.csv
-            exits_log.txt
             exits_log.csv
             positions_tracking.csv
             fast_trades_entries.csv
             fast_trades_exits.csv
             orb_signals.csv
             orb_trades.csv
-            orb_trading_log.txt
-            cache_stats.json
             fii_dii_cache.json
             fii_dii_trend_cache.json
             FII_DII_*.csv
-
-      # ── 10. Upload debug logs on failure ─────────────────────────────────────
-      - name: Upload debug logs (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-logs-${{ github.run_id }}
-          retention-days: 7
-          path: |
-            logs/
-            *.log
-
