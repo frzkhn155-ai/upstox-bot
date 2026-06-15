@@ -58,7 +58,7 @@ sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 # ============ CREDENTIALS - ENV VARS (with hardcoded fallbacks) ============
 EMAIL          = os.environ.get("UPSTOX_EMAIL",    "frzkhn155@gmail.com")
 EMAIL_PASSWORD = os.environ.get("UPSTOX_PASSWORD", "vdeahogzvpsmfirv")
-MOBILE_NUMBER  = os.environ.get("UPSTOX_MOBILE",   "7397408750")
+MOBILE_NUMBER  = os.environ.get("UPSTOX_MOBILE",   "9940220575")
 PASSCODE       = os.environ.get("UPSTOX_PASSCODE", "952495")
 
 # ── Upstox OAuth app credentials (for Android token refresh) ─────────────────
@@ -66,8 +66,8 @@ PASSCODE       = os.environ.get("UPSTOX_PASSCODE", "952495")
 # API Key    = "Client ID" on the Upstox developer portal
 # API Secret = "Client Secret"
 # Redirect   = must match exactly what you set in the app (use the one below)
-UPSTOX_API_KEY      = os.environ.get("UPSTOX_API_KEY",    "ea9b2ade-6720-4a0b-a8a5-6e1710f55844")
-UPSTOX_API_SECRET   = os.environ.get("UPSTOX_API_SECRET", "csxmppf5zd")
+UPSTOX_API_KEY      = os.environ.get("UPSTOX_API_KEY",    "a095096a-9467-4d1a-9579-afaedca19bca")
+UPSTOX_API_SECRET   = os.environ.get("UPSTOX_API_SECRET", "z65lzqkm01")
 UPSTOX_REDIRECT_URI = "http://127.0.0.1:8080/"        # must match your app settings
 
 # ── Headless OAuth local server port ─────────────────────────────────────────
