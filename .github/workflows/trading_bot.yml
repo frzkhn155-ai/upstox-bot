@@ -12,8 +12,6 @@ name: Upstox Trading Bot
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  schedule:
-    - cron: '59 3 * * 1-5'    # 09:29 IST Mon–Fri (14 min after Final starts)
   workflow_dispatch:
     inputs:
       reason:
