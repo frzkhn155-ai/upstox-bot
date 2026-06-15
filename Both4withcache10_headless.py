@@ -90,7 +90,7 @@ CHARTINK_COOKIES = {
 # 3. Copy XSRF-TOKEN and ci_session from Request Headers → Cookies
 
 # ========== HARDCODED TOKEN OPTION ==========
-HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIyMkM4REwiLCJqdGkiOiI2OWUxYTUxNmVhOTJhNTBmZTYwZjAwY2IiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzc2Mzk1NTQyLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NzY0NjMyMDB9.enP-ZbfL-q4JCJ78u-l9QVDUj71LOV2Ogi8QmeLXRDg"          # Intentionally blank — token is injected via UPSTOX_TOKEN secret
+HARDCODED_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1VUNRNkYiLCJqdGkiOiI2YTJmNDZkNTYwYWYyZDI4MWYzMThkM2UiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc4MTQ4MzIyMSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzgxNTYwODAwfQ._nt94u_G1C9eD7F46Nw4izlZu-HdgB4oOlFIrOEHa0g"          # Intentionally blank — token is injected via UPSTOX_TOKEN secret
 USE_HARDCODED_TOKEN = True   # Disabled — bot reads upstox_token.txt written by the workflow
 
 # Token timestamp file
