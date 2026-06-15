@@ -56,8 +56,8 @@ sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)  # Line-buffered
 sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
 
 # ============ CREDENTIALS - ENV VARS (with hardcoded fallbacks) ============
-EMAIL          = os.environ.get("UPSTOX_EMAIL",    "frzkhn155@gmail.com")
-EMAIL_PASSWORD = os.environ.get("UPSTOX_PASSWORD", "vdeahogzvpsmfirv")
+EMAIL          = os.environ.get("UPSTOX_EMAIL",    "shameera252329@gmail.com")
+EMAIL_PASSWORD = os.environ.get("UPSTOX_PASSWORD", "ktymhoqfglubmenh")
 MOBILE_NUMBER  = os.environ.get("UPSTOX_MOBILE",   "9940220575")
 PASSCODE       = os.environ.get("UPSTOX_PASSCODE", "952495")
 
