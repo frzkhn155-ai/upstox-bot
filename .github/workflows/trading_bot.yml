@@ -30,12 +30,81 @@ jobs:
     timeout-minutes: 390      # 6.5 hours — covers full market session + buffer
 
     steps:
+      # ── 0. MARKET PRE-CHECK — gates every step below ──────────────────────
+      # This step decides should_run=true/false. Every later step that should
+      # be skipped checks `if: steps.precheck.outputs.should_run == 'true'`.
+      # A precheck that merely prints a message and exits 0 does NOT stop the
+      # workflow — GitHub Actions still runs the next step regardless. That
+      # was the bug: the check existed (maybe) but nothing downstream read it.
+      - name: Market pre-check
+        id: precheck
+        env:
+          TZ: Asia/Kolkata
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+        run: |
+          set +e   # never let this step itself fail the job
+
+          NOW_DOW=$(date +%u)      # 1=Mon ... 6=Sat 7=Sun
+          NOW_HM=$(date +%H:%M)
+          NOW_FULL=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+          echo "🕐 Current time (IST): $NOW_FULL"
+
+          SHOULD_RUN=true
+          REASON=""
+
+          # ── 1. Weekend skip ──────────────────────────────────────────────
+          if [ "$NOW_DOW" -ge 6 ]; then
+            SHOULD_RUN=false
+            REASON="Weekend (day-of-week=$NOW_DOW) — market closed"
+          fi
+
+          # ── 2. Time window: 09:00–15:40 IST ──────────────────────────────
+          if [ "$SHOULD_RUN" = "true" ]; then
+            if [[ "$NOW_HM" < "09:00" || "$NOW_HM" > "15:40" ]]; then
+              SHOULD_RUN=false
+              REASON="Outside trading window 09:00-15:40 IST (now $NOW_HM)"
+            fi
+          fi
+
+          # ── 3. Upstox holiday/market-status check ────────────────────────
+          # Best-effort only: if the token is stale/missing or the API call
+          # fails, we do NOT block the run on this check (fail-open) — the
+          # weekday + time window gates above are the primary safety net.
+          if [ "$SHOULD_RUN" = "true" ] && [ -n "$UPSTOX_TOKEN" ]; then
+            RESP=$(curl -s -m 10 -H "Authorization: Bearer $UPSTOX_TOKEN" \
+                   -H "Accept: application/json" \
+                   "https://api.upstox.com/v2/market/status/NSE")
+            STATUS=$(echo "$RESP" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('data',{}).get('status','UNKNOWN'))" 2>/dev/null)
+            [ -z "$STATUS" ] && STATUS="UNKNOWN"
+            echo "📡 Upstox market status API → $STATUS"
+            if [ "$STATUS" = "CLOSED" ]; then
+              SHOULD_RUN=false
+              REASON="Upstox reports market CLOSED (holiday or after-hours)"
+            fi
+          else
+            echo "ℹ️  Skipping Upstox holiday API check (no token yet / will OAuth fresh)"
+          fi
+
+          # ── Output result ─────────────────────────────────────────────────
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
+          if [ "$SHOULD_RUN" = "true" ]; then
+            echo -e "\033[1;32m✅ PRE-CHECK PASSED — proceeding with trading run\033[0m"
+          else
+            echo -e "\033[1;31m⛔ PRE-CHECK FAILED — $REASON\033[0m"
+            echo -e "\033[1;33m⚠️  All remaining steps will be skipped.\033[0m"
+          fi
+
       # ── 1. Checkout code ────────────────────────────────────────────────────
       - name: Checkout repository
+        if: steps.precheck.outputs.should_run == 'true'
         uses: actions/checkout@v4
 
       # ── 2. Set up Python ────────────────────────────────────────────────────
       - name: Set up Python 3.11
+        if: steps.precheck.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -43,12 +112,14 @@ jobs:
 
       # ── 3. System dependencies ───────────────────────────────────────────────
       - name: Install system dependencies
+        if: steps.precheck.outputs.should_run == 'true'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y xclip xdotool xvfb
 
       # ── 4. Google Chrome (modern signed-keyring method) ──────────────────────
       - name: Install Google Chrome
+        if: steps.precheck.outputs.should_run == 'true'
         run: |
           sudo install -m 0755 -d /etc/apt/keyrings
           wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
@@ -63,6 +134,7 @@ jobs:
 
       # ── 5. Install Python dependencies ──────────────────────────────────────
       - name: Install Python packages
+        if: steps.precheck.outputs.should_run == 'true'
         run: |
           pip install --upgrade pip
           pip install scipy
@@ -70,6 +142,7 @@ jobs:
 
       # ── 6. Restore candle cache ──────────────────────────────────────────────
       - name: Restore candle cache
+        if: steps.precheck.outputs.should_run == 'true'
         uses: actions/cache@v4
         with:
           path: candle_cache/
@@ -81,6 +154,7 @@ jobs:
       # NOTE: uses a SEPARATE cache key from Final/Final-ORB-Only so there is
       # zero risk of accidentally loading a token from a different API app.
       - name: Restore Upstox token (upstox-bot own cache)
+        if: steps.precheck.outputs.should_run == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -93,6 +167,7 @@ jobs:
 
       # ── 8. Validate token secret ─────────────────────────────────────────────
       - name: Validate Upstox token secret
+        if: steps.precheck.outputs.should_run == 'true'
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
         run: |
@@ -104,6 +179,7 @@ jobs:
 
       # ── 9. Run the bot ───────────────────────────────────────────────────────
       - name: Run trading bot
+        if: steps.precheck.outputs.should_run == 'true'
         env:
           UPSTOX_EMAIL:        ${{ secrets.UPSTOX_EMAIL }}
           UPSTOX_PASSWORD:     ${{ secrets.UPSTOX_PASSWORD }}
@@ -168,7 +244,7 @@ jobs:
 
       # ── 10. End-of-day self-sync (safety net) ────────────────────────────────
       - name: Save token to upstox-bot secret (end-of-day)
-        if: always()
+        if: always() && steps.precheck.outputs.should_run == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
@@ -191,7 +267,7 @@ jobs:
 
       # ── 11. Commit trading logs to repo ──────────────────────────────────────
       - name: Commit trading logs to repo
-        if: always()
+        if: always() && steps.precheck.outputs.should_run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -218,7 +294,7 @@ jobs:
 
       # ── 12. Save token cache for next run ────────────────────────────────────
       - name: Save Upstox token cache (post-run)
-        if: always()
+        if: always() && steps.precheck.outputs.should_run == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -229,7 +305,7 @@ jobs:
 
       # ── 13. Upload trading logs as artifacts ─────────────────────────────────
       - name: Upload trading logs
-        if: always()
+        if: always() && steps.precheck.outputs.should_run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: trading-logs-${{ github.run_id }}
@@ -251,3 +327,14 @@ jobs:
             fii_dii_cache.json
             fii_dii_trend_cache.json
             FII_DII_*.csv
+
+      # ── 14. Run summary ───────────────────────────────────────────────────────
+      - name: Run summary
+        if: always()
+        run: |
+          if [ "${{ steps.precheck.outputs.should_run }}" = "true" ]; then
+            echo "✅ Pre-check passed — trading bot ran this session."
+          else
+            echo "⛔ Pre-check SKIPPED this run."
+            echo "   Reason: ${{ steps.precheck.outputs.reason }}"
+          fi
