@@ -7,25 +7,22 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==== CONFIGURATION ====
-NUM_WORKERS = 7  # Adjust based on your PC and site capacity
+NUM_WORKERS = 1  # start with 1; increase later
 
 input_file = r'C:\Users\cb99354\Desktop\1.txt'
 notfound_file = r'C:\Users\cb99354\Desktop\notfound.txt'
 status_file = r'C:\Users\cb99354\Desktop\status.txt'
 
-# Clear the status file at the start (fresh run)
+# Clear status at start
 open(status_file, 'w').close()
 
-# Known team member first names, used as an additional confirmation check
-# alongside the Received At date match. Matching tolerates 1-2 letter typos.
+# Team names (unchanged)
 TEAM_NAMES = [
     "INFANT", "DINESH", "DURGA", "ELUMALAI", "FEROZ", "PRIYA",
     "SATISH", "SNEHA", "SOWMIYA", "SRINATH", "THIRU", "LOKESH", "PREETI",
 ]
 
-
 def levenshtein(a, b):
-    """Edit distance between two strings (for fuzzy name matching)."""
     if len(a) < len(b):
         return levenshtein(b, a)
     if len(b) == 0:
@@ -41,16 +38,9 @@ def levenshtein(a, b):
         previous_row = current_row
     return previous_row[-1]
 
-
 def is_team_member(updated_by_text, max_distance=2):
-    """
-    Fuzzy-match the 'Updated By' name against TEAM_NAMES, tolerating
-    1-2 letter spelling differences (e.g. 'Feroz Khan (CB99354)' -> FEROZ).
-    Returns (True, matched_team_name) or (False, None).
-    """
     if not updated_by_text:
         return False, None
-    # Drop trailing employee code like "(CB99354)" and split into words
     name_part = updated_by_text.split('(')[0].strip().upper()
     words = [w for w in name_part.split() if w]
     for word in words:
@@ -59,36 +49,31 @@ def is_team_member(updated_by_text, max_distance=2):
                 return True, team_name
     return False, None
 
-
-# Shared data structures with thread-safe lock
-# Using a dictionary to store results by index to preserve order (for final summary and notfound)
-results = {}  # Format: {index: 'YES'/'NO'/'NA'}
-updater_names = {}  # Format: {index: 'name who updated / blank'}
+# Shared structures
+results = {}
+updater_names = {}
 lock = threading.Lock()
-file_lock = threading.Lock()  # For writing to status.txt
+file_lock = threading.Lock()
 
 def write_status(loan_no, status, updater_name):
-    """Thread-safe append of one result line to status.txt"""
     with file_lock:
         with open(status_file, 'a', encoding='utf-8') as f:
             f.write(f"{loan_no}\t{status}\t{updater_name}\n")
 
-# ==== READ INPUT RECORDS ====
+# Read records (same as original)
 records = []
-original_lines = []  # To keep track of input order
 with open(input_file, 'r', encoding='utf-8') as f:
     for idx, line in enumerate(f):
-        original_lines.append(line.strip())
         parts = line.strip().split('\t')
         if len(parts) >= 9:
             date_txt = parts[0]
             pod_no = parts[4]
-            document_type = parts[5].strip()  # e.g., 'PDD', 'OTC', 'FILE AND DOCKET'
-            orig_status = parts[6].strip()  # 'WITH ORGINAL' or 'WITHOUT ORGINAL'
+            document_type = parts[5].strip()
+            orig_status = parts[6].strip()
             loan_no = parts[-1]
-            remark_val = f"{document_type} {orig_status}"  # for Remarks
+            remark_val = f"{document_type} {orig_status}"
             records.append({
-                'index': idx,  # Store original index
+                'index': idx,
                 'date_txt': date_txt,
                 'pod_no': pod_no,
                 'remark': remark_val,
@@ -96,41 +81,28 @@ with open(input_file, 'r', encoding='utf-8') as f:
                 'document_type': document_type
             })
 
-print(f"Total records to process: {len(records)}")
-print(f"Using {NUM_WORKERS} parallel workers\n")
+print(f"Total records: {len(records)}, using {NUM_WORKERS} worker(s).")
 
-# ==== POD MATCHING FUNCTION ====
+# POD matching (same as original)
 def pod_matches(input_pod, dms_pod, min_match_length=8):
-    """
-    Flexible POD matching that handles extra/missing digits anywhere.
-    Returns True if there's significant overlap between the two POD numbers.
-    """
     input_pod = input_pod.strip()
     dms_pod = dms_pod.strip()
-    
-    # Exact match
     if input_pod == dms_pod:
         return True
-    
-    # One is contained in the other
     if input_pod in dms_pod or dms_pod in input_pod:
         return True
-    
-    # Find longest common substring
     longer = input_pod if len(input_pod) >= len(dms_pod) else dms_pod
     shorter = dms_pod if len(input_pod) >= len(dms_pod) else input_pod
-    
     if len(shorter) >= min_match_length:
         for i in range(len(shorter) - min_match_length + 1):
-            substring = shorter[i:i + min_match_length]
-            if substring in longer:
+            if shorter[i:i+min_match_length] in longer:
                 return True
-    
     return False
 
-# ==== CORE PROCESSING (USES EXISTING LOGGED-IN DRIVER) ====
+# =====================================================
+# PROCESS ONE LOAN (original logic, only update link fix)
+# =====================================================
 def process_loan(rec, worker_id, driver):
-    """Process a single loan using an already logged-in driver."""
     idx = rec['index']
     loan_no = rec['loan_no']
     pod_no = rec['pod_no']
@@ -138,31 +110,28 @@ def process_loan(rec, worker_id, driver):
     remark_val = rec['remark']
     document_type = rec['document_type']
     
-    status_result = "NO"  # Default
-    updater_name = ""  # Who performed/already did the update
+    status_result = "NO"
+    updater_name = ""
     
     try:
         loan_url = f"https://dcm.chola.murugappa.com/loan-details/{loan_no}"
         driver.get(loan_url)
         time.sleep(2)
         
+        # Click Dispatch tab
         try:
             dispatch_tab = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.ID, "pills-profile-tab"))
             )
             dispatch_tab.click()
             time.sleep(2)
-            
-            # Wait for the dispatch table to be present after tab switch
+            # Wait for table rows
             WebDriverWait(driver, 10).until(
                 EC.presence_of_all_elements_located((By.XPATH, "//table/tbody/tr"))
             )
         except Exception as ex:
-            print(f"[Worker-{worker_id}] [{loan_no}] Dispatch tab not found: {ex}")
-            if document_type.upper() == "OTC":
-                status_result = "NA"
-            else:
-                status_result = "NO"
+            print(f"[W{worker_id}] [{loan_no}] Dispatch tab error: {ex}")
+            status_result = "NA" if document_type.upper() == "OTC" else "NO"
             write_status(loan_no, status_result, updater_name)
             with lock:
                 results[idx] = status_result
@@ -171,31 +140,26 @@ def process_loan(rec, worker_id, driver):
         
         found = False
         table_rows = driver.find_elements(By.XPATH, "//table/tbody/tr")
-        
         for row in table_rows:
             cells = row.find_elements(By.TAG_NAME, "td")
             if cells:
                 dms_pod = cells[0].text.strip()
-                
-                # Use flexible matching for POD numbers
                 if pod_matches(pod_no, dms_pod):
                     found = True
-                    print(f"[Worker-{worker_id}] [{loan_no}] POD matched: Input={pod_no}, DMS={dms_pod}")
+                    print(f"[W{worker_id}] [{loan_no}] POD matched: Input={pod_no}, DMS={dms_pod}")
                     
-                    # Accept date_txt in either 'DD.MM.YYYY' or 'DD-MM-YYYY' format
+                    # parse date
                     if '.' in date_txt:
                         day, month, year = date_txt.split('.')
                     elif '-' in date_txt:
                         day, month, year = date_txt.split('-')
                     else:
-                        raise ValueError(f"Unrecognized date format: {date_txt}")
+                        raise ValueError(f"Bad date: {date_txt}")
                     date_formatted = f"{day}/{month}/{year}"
                     
-                    # --------------------------------------------------------------
-                    # FIX: Use robust XPath to find the update element (link/button)
-                    # --------------------------------------------------------------
+                    # ---------- FIX: robust update element ----------
                     try:
-                        # Wait for the update element inside the row to be present
+                        # Use flexible XPath to find any Update link/button
                         update_element = WebDriverWait(row, 5).until(
                             EC.presence_of_element_located(
                                 (By.XPATH, ".//a[contains(text(),'Update')] | .//button[contains(text(),'Update')] | .//input[@value='Update']")
@@ -205,198 +169,135 @@ def process_loan(rec, worker_id, driver):
                         update_element.click()
                         time.sleep(2)
                         
-                        WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.ID, "status"))
-                        )
-                        
+                        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "status")))
                         Select(driver.find_element(By.ID, "status")).select_by_visible_text("Received")
-                        
                         date_input = driver.find_element(By.ID, "received_date")
                         date_input.clear()
                         date_input.send_keys(date_formatted)
                         time.sleep(1)
-                        
                         remark_input = driver.find_element(By.ID, "remark")
                         remark_input.clear()
                         remark_input.send_keys(remark_val)
                         time.sleep(1)
-                        
-                        submit_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-                        submit_btn.click()
-                        
-                        print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} updated: '{remark_val}'")
+                        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+                        print(f"[W{worker_id}] [{loan_no}] POD {dms_pod} updated.")
                         status_result = "YES"
                         updater_name = "cb112700 (script)"
-                            
                     except Exception as e:
-                        # Update element not found – someone else may have already updated.
-                        # Check both date and team member name to confirm.
+                        # Update not found – check if already updated by team member
                         try:
                             if len(cells) > 7:
                                 updated_by_text = cells[6].text.strip()
                                 received_at_text = cells[7].text.strip()
-                                
                                 received_at_filled = bool(received_at_text) and received_at_text != "-"
                                 date_ok = received_at_filled and received_at_text == date_formatted
-                                member_ok, matched_team_name = is_team_member(updated_by_text)
-                                
+                                member_ok, matched = is_team_member(updated_by_text)
                                 if date_ok and member_ok:
-                                    print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} Received At='{received_at_text}' matches expected '{date_formatted}' AND updater '{updated_by_text}' matches team member '{matched_team_name}' - marking as YES")
                                     status_result = "YES"
-                                    updater_name = updated_by_text if updated_by_text else "(name blank)"
-                                elif date_ok and not member_ok:
-                                    print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} - Date matches but updater '{updated_by_text}' not recognized as team member - marking as NO")
-                                    status_result = "NO"
-                                elif received_at_filled:
-                                    print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} - Received At='{received_at_text}' does NOT match expected '{date_formatted}' - marking as NO")
-                                    status_result = "NO"
+                                    updater_name = updated_by_text
+                                    print(f"[W{worker_id}] [{loan_no}] Already updated by {matched}")
                                 else:
-                                    print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} - Received At not filled ('{received_at_text}') - marking as NO")
                                     status_result = "NO"
+                                    print(f"[W{worker_id}] [{loan_no}] Date mismatch or not team.")
                             else:
-                                print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} - Cannot verify Received At column")
                                 status_result = "NO"
-                                    
-                        except Exception as check_ex:
-                            print(f"[Worker-{worker_id}] [{loan_no}] Update/entry problem: {e}")
+                        except:
                             status_result = "NO"
                     
-                    # Write the result immediately after processing this row
                     write_status(loan_no, status_result, updater_name)
                     break
         
         if not found:
-            if document_type.upper() == "OTC":
-                print(f"[Worker-{worker_id}] [{loan_no}] POD {pod_no} not found - OTC marked as NA.")
-                status_result = "NA"
-            else:
-                print(f"[Worker-{worker_id}] [{loan_no}] POD {pod_no} not found.")
-                status_result = "NO"
+            status_result = "NA" if document_type.upper() == "OTC" else "NO"
+            print(f"[W{worker_id}] [{loan_no}] POD not found.")
             write_status(loan_no, status_result, updater_name)
-                
     except Exception as e:
-        print(f"[Worker-{worker_id}] Error processing loan {loan_no}: {e}")
-        if document_type.upper() == "OTC":
-            status_result = "NA"
-        else:
-            status_result = "NO"
+        print(f"[W{worker_id}] [{loan_no}] Error: {e}")
+        status_result = "NA" if document_type.upper() == "OTC" else "NO"
         write_status(loan_no, status_result, updater_name)
-            
+    
     with lock:
         results[idx] = status_result
         updater_names[idx] = updater_name
 
-# ==== WORKER FUNCTION (ONE LOGIN, ONE BROWSER PER WORKER) WITH RETRY ====
+# =====================================================
+# WORKER – uses original driver creation and login
+# =====================================================
 def worker_function(records_batch, worker_id):
-    """Each worker opens Chrome once, logs in once (with retry), reuses session."""
     if not records_batch:
         return
-
-    print(f"[Worker-{worker_id}] Starting, {len(records_batch)} records")
-    driver = webdriver.Chrome()
-
+    print(f"[W{worker_id}] Starting, {len(records_batch)} records.")
+    
+    # ---- Original driver creation ----
+    driver = webdriver.Chrome()  # No service/options – as in your working script
+    
     try:
-        # ---- Login with retry ----
+        # ---- Login with simple retry ----
         max_attempts = 3
-        login_success = False
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, max_attempts+1):
             try:
                 driver.get("https://dcm.chola.murugappa.com/login")
                 WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.ID, "username"))
                 ).send_keys("cb112700")
-
                 driver.find_element(By.ID, "password").send_keys("Naruto@@2005")
-
-                WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.CLASS_NAME, "btn-primary"))
-                ).click()
-
-                # =============================================================
-                # IMPORTANT: Replace "some-element-after-login" with an actual
-                # element ID that only appears after successful login, e.g.,
-                # a dashboard heading, user avatar, or navigation bar.
-                # If you cannot find one, use EC.url_contains("/dashboard")
-                # =============================================================
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.ID, "some-element-after-login"))
-                )
-                print(f"[Worker-{worker_id}] Login successful (attempt {attempt})")
-                login_success = True
-                break  # Exit retry loop
-
+                driver.find_element(By.CLASS_NAME, "btn-primary").click()
+                time.sleep(3)  # Wait for login to complete – same as original
+                print(f"[W{worker_id}] Login successful (attempt {attempt}).")
+                break
             except Exception as e:
-                print(f"[Worker-{worker_id}] Login attempt {attempt} failed: {e}")
+                print(f"[W{worker_id}] Login attempt {attempt} failed: {e}")
                 if attempt == max_attempts:
-                    raise  # Re-raise after final attempt
-                time.sleep(2 ** attempt)  # exponential backoff: 2, 4, 8 sec
-
-        if not login_success:
-            # If we exhausted attempts without success, raise an error
-            raise Exception("All login attempts failed")
-
-        # Process all records with this session
+                    raise
+                time.sleep(2 ** attempt)
+        
+        # ---- Process records ----
         for idx, rec in enumerate(records_batch, 1):
-            print(f"[Worker-{worker_id}] {idx}/{len(records_batch)} -> {rec['loan_no']}")
+            print(f"[W{worker_id}] {idx}/{len(records_batch)} -> {rec['loan_no']}")
             process_loan(rec, worker_id, driver)
             time.sleep(1)
-
-        print(f"[Worker-{worker_id}] Completed.")
-
+        print(f"[W{worker_id}] Completed.")
     except Exception as e:
-        print(f"[Worker-{worker_id}] Fatal error: {e}")
-        # Optionally write an error status for all remaining records in the batch
+        print(f"[W{worker_id}] Fatal error: {e}")
+        # Mark remaining as ERROR
         for rec in records_batch:
-            write_status(rec['loan_no'], "ERROR", "")
+            write_status(rec['loan_no'], "ERROR", "Worker failed")
             with lock:
                 results[rec['index']] = "ERROR"
                 updater_names[rec['index']] = "Login failed"
-
     finally:
         driver.quit()
 
-# ==== SPLIT RECORDS ACROSS WORKERS ====
+# Split and run (same as original)
 def split_records(all_records, num_workers):
-    """Split records list into roughly equal batches."""
     if num_workers <= 0:
         num_workers = 1
     if num_workers > len(all_records):
         num_workers = len(all_records)
-    
     base = len(all_records) // num_workers
     rem = len(all_records) % num_workers
-    
     batches = []
     start = 0
     for i in range(num_workers):
         end = start + base + (1 if i < rem else 0)
         batches.append(all_records[start:end])
         start = end
-    
     return batches
 
-# ==== MAIN EXECUTION ====
 if __name__ == "__main__":
     start_time = time.time()
-    
     batches = split_records(records, NUM_WORKERS)
-    
     with ThreadPoolExecutor(max_workers=len(batches)) as executor:
-        futures = []
-        for worker_id, batch in enumerate(batches, 1):
-            if batch:
-                futures.append(executor.submit(worker_function, batch, worker_id))
-        
+        futures = [executor.submit(worker_function, batch, i+1) for i, batch in enumerate(batches) if batch]
         for fut in as_completed(futures):
             try:
                 fut.result()
             except Exception as e:
                 print(f"Worker error: {e}")
-    
-    # Write not found file (still at the end)
+
+    # Write notfound.txt
     with open(notfound_file, 'w', encoding='utf-8') as nf:
-        sorted_results = sorted(results.items())
-        for idx, status in sorted_results:
+        for idx, status in sorted(results.items()):
             if status == "NO":
                 rec = next((r for r in records if r['index'] == idx), None)
                 if rec:
@@ -405,24 +306,15 @@ if __name__ == "__main__":
                 rec = next((r for r in records if r['index'] == idx), None)
                 if rec:
                     nf.write(f"{rec['loan_no']}\tOTC-NA\n")
-    
+
     elapsed = time.time() - start_time
-    
-    # Count stats (exclude ERROR)
-    yes_count = sum(1 for s in results.values() if s == "YES")
-    no_count = sum(1 for s in results.values() if s == "NO")
-    na_count = sum(1 for s in results.values() if s == "NA")
-    err_count = sum(1 for s in results.values() if s == "ERROR")
-    
-    print("\n" + "=" * 70)
+    yes = sum(1 for s in results.values() if s == "YES")
+    no = sum(1 for s in results.values() if s == "NO")
+    na = sum(1 for s in results.values() if s == "NA")
+    err = sum(1 for s in results.values() if s == "ERROR")
+    print("\n" + "="*70)
     print("SCRIPT COMPLETED")
-    print("=" * 70)
-    print(f"Total records       : {len(records)}")
-    print(f"Successfully updated: {yes_count}")
-    print(f"Not found / failed  : {no_count}")
-    print(f"OTC - NA            : {na_count}")
-    print(f"Login/other errors  : {err_count}")
-    print(f"Workers used        : {len(batches)}")
-    print(f"Time taken (sec)    : {elapsed:.2f}")
-    print("Check status.txt (updated live) and notfound.txt on Desktop.")
-    print("=" * 70)
+    print(f"Total: {len(records)} | YES: {yes} | NO: {no} | NA: {na} | ERROR: {err}")
+    print(f"Workers: {len(batches)} | Time: {elapsed:.2f}s")
+    print("Check status.txt (live) and notfound.txt")
+    print("="*70)
