@@ -3,7 +3,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,18 +11,21 @@ import os
 import random
 import sys
 
-# ---- Use webdriver_manager to auto-handle ChromeDriver ----
+# ---- webdriver_manager ----
 try:
     from webdriver_manager.chrome import ChromeDriverManager
 except ImportError:
-    print("ERROR: webdriver-manager not installed.")
-    print("Please run: pip install webdriver-manager")
+    print("ERROR: webdriver-manager not installed. Run: pip install webdriver-manager")
     sys.exit(1)
 
 # ==== CONFIGURATION ====
 NUM_WORKERS = 1
 MAX_LOGIN_ATTEMPTS = 3
 RETRY_DELAY_BASE = 2
+
+# Proxy settings (uncomment and fill if needed)
+# PROXY = "http://proxy.yourcompany.com:8080"
+# PROXY = "socks5://proxy:1080"
 
 DESKTOP = os.path.expanduser("~/Desktop")
 DEFAULT_INPUT = os.path.join(DESKTOP, "1.txt")
@@ -35,7 +38,6 @@ if len(sys.argv) > 1:
 else:
     input_file = DEFAULT_INPUT
 
-# Team names (unchanged)
 TEAM_NAMES = [
     "INFANT", "DINESH", "DURGA", "ELUMALAI", "FEROZ", "PRIYA",
     "SATISH", "SNEHA", "SOWMIYA", "SRINATH", "THIRU", "LOKESH", "PREETI",
@@ -87,13 +89,12 @@ def pod_matches(input_pod, dms_pod, min_match_length=8):
 
 # ==== IMMEDIATE WRITE ====
 write_lock = threading.Lock()
-
 def write_result(loan_no, status, updater_name=""):
     with write_lock:
         with open(TEMP_STATUS_FILE, 'a', encoding='utf-8') as f:
             f.write(f"{loan_no}\t{status}\t{updater_name}\n")
 
-# ==== CORE PROCESSING (improved) ====
+# ==== CORE PROCESSING (unchanged) ====
 def process_loan(rec, worker_id, driver):
     loan_no = rec['loan_no']
     pod_no = rec['pod_no']
@@ -240,7 +241,7 @@ def process_loan(rec, worker_id, driver):
             status_result = "NO"
         write_result(loan_no, status_result, updater_name)
 
-# ==== WORKER WITH LOGIN RETRY AND AUTO-DRIVER ====
+# ==== WORKER WITH CONNECTIVITY TEST ====
 def worker_function(records_batch, worker_id):
     if not records_batch:
         return
@@ -253,22 +254,37 @@ def worker_function(records_batch, worker_id):
             if driver is not None:
                 driver.quit()
 
-            # ---- Use ChromeDriverManager to get the correct driver ----
+            # Create driver with optional proxy
             service = Service(ChromeDriverManager().install())
             options = webdriver.ChromeOptions()
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-gpu")
-            # Uncomment next line if you want headless (no GUI)
+            # Uncomment if you want headless:
             # options.add_argument("--headless")
+
+            # Proxy configuration (uncomment and set PROXY above)
+            # if PROXY:
+            #     options.add_argument(f'--proxy-server={PROXY}')
 
             driver = webdriver.Chrome(service=service, options=options)
 
-            driver.get("https://dcm.chola.murugappa.com/login")
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, "username"))
-            ).send_keys("cb112700")
+            # ---- TEST CONNECTIVITY BEFORE LOGIN ----
+            print(f"[Worker-{worker_id}] Testing connectivity to DCM...")
+            driver.set_page_load_timeout(15)  # seconds
+            try:
+                driver.get("https://dcm.chola.murugappa.com/login")
+                # Wait for a known element to appear (username field) to confirm page loaded
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.ID, "username"))
+                )
+                print(f"[Worker-{worker_id}] Connectivity OK - login page loaded.")
+            except Exception as conn_err:
+                print(f"[Worker-{worker_id}] CONNECTIVITY ERROR: {conn_err}")
+                raise  # re-raise to trigger retry
 
+            # ---- Now proceed with actual login ----
+            driver.find_element(By.ID, "username").send_keys("cb112700")
             driver.find_element(By.ID, "password").send_keys("Naruto@@2005")
             WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.CLASS_NAME, "btn-primary"))
@@ -278,7 +294,8 @@ def worker_function(records_batch, worker_id):
                 EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Dashboard')]"))
             )
             print(f"[Worker-{worker_id}] Login successful on attempt {attempt}")
-            break
+            break  # success, exit retry loop
+
         except Exception as e:
             print(f"[Worker-{worker_id}] Login attempt {attempt} failed: {e}")
             if attempt == MAX_LOGIN_ATTEMPTS:
@@ -287,8 +304,10 @@ def worker_function(records_batch, worker_id):
                     driver.quit()
                 return
             delay = RETRY_DELAY_BASE ** attempt + random.uniform(0, 1)
+            print(f"[Worker-{worker_id}] Retrying in {delay:.2f} seconds...")
             time.sleep(delay)
 
+    # Process records
     for idx, rec in enumerate(records_batch, 1):
         print(f"[Worker-{worker_id}] {idx}/{len(records_batch)} -> {rec['loan_no']}")
         process_loan(rec, worker_id, driver)
@@ -297,7 +316,7 @@ def worker_function(records_batch, worker_id):
     driver.quit()
     print(f"[Worker-{worker_id}] Completed.")
 
-# ==== MAIN ====
+# ==== MAIN (unchanged) ====
 if __name__ == "__main__":
     start_time = time.time()
 
@@ -359,16 +378,16 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Worker error: {e}")
 
-    # Merge temp results
     results_by_loan = {}
-    with open(TEMP_STATUS_FILE, 'r', encoding='utf-8') as tf:
-        for line in tf:
-            parts = line.strip().split('\t')
-            if len(parts) >= 2:
-                loan = parts[0]
-                status = parts[1]
-                name = parts[2] if len(parts) > 2 else ""
-                results_by_loan[loan] = (status, name)
+    if os.path.exists(TEMP_STATUS_FILE):
+        with open(TEMP_STATUS_FILE, 'r', encoding='utf-8') as tf:
+            for line in tf:
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    loan = parts[0]
+                    status = parts[1]
+                    name = parts[2] if len(parts) > 2 else ""
+                    results_by_loan[loan] = (status, name)
 
     with open(STATUS_FILE, 'w', encoding='utf-8') as sf:
         for rec in records:
