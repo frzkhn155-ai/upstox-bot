@@ -1,4 +1,5 @@
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
@@ -10,25 +11,31 @@ import os
 import random
 import sys
 
+# ---- Use webdriver_manager to auto-handle ChromeDriver ----
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+except ImportError:
+    print("ERROR: webdriver-manager not installed.")
+    print("Please run: pip install webdriver-manager")
+    sys.exit(1)
+
 # ==== CONFIGURATION ====
-NUM_WORKERS = 1                    # increase if your PC and site can handle more
+NUM_WORKERS = 1
 MAX_LOGIN_ATTEMPTS = 3
 RETRY_DELAY_BASE = 2
 
-# Default file paths (uses current user's Desktop)
 DESKTOP = os.path.expanduser("~/Desktop")
 DEFAULT_INPUT = os.path.join(DESKTOP, "1.txt")
 NOTFOUND_FILE = os.path.join(DESKTOP, "notfound.txt")
 STATUS_FILE = os.path.join(DESKTOP, "status.txt")
 TEMP_STATUS_FILE = os.path.join(DESKTOP, "status_temp.txt")
 
-# Allow command‑line argument for input file
 if len(sys.argv) > 1:
     input_file = sys.argv[1]
 else:
     input_file = DEFAULT_INPUT
 
-# Known team member first names
+# Team names (unchanged)
 TEAM_NAMES = [
     "INFANT", "DINESH", "DURGA", "ELUMALAI", "FEROZ", "PRIYA",
     "SATISH", "SNEHA", "SOWMIYA", "SRINATH", "THIRU", "LOKESH", "PREETI",
@@ -88,7 +95,6 @@ def write_result(loan_no, status, updater_name=""):
 
 # ==== CORE PROCESSING (improved) ====
 def process_loan(rec, worker_id, driver):
-    idx = rec['index']
     loan_no = rec['loan_no']
     pod_no = rec['pod_no']
     date_txt = rec['date_txt']
@@ -103,7 +109,6 @@ def process_loan(rec, worker_id, driver):
         driver.get(loan_url)
         time.sleep(2)
 
-        # Click Dispatch tab
         try:
             dispatch_tab = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.ID, "pills-profile-tab"))
@@ -134,7 +139,6 @@ def process_loan(rec, worker_id, driver):
                 found = True
                 print(f"[Worker-{worker_id}] [{loan_no}] POD matched: Input={pod_no}, DMS={dms_pod}")
 
-                # Format date
                 if '.' in date_txt:
                     day, month, year = date_txt.split('.')
                 elif '-' in date_txt:
@@ -143,17 +147,13 @@ def process_loan(rec, worker_id, driver):
                     raise ValueError(f"Unrecognized date format: {date_txt}")
                 date_formatted = f"{day}/{month}/{year}"
 
-                # ---- Try to find and click Update ----
                 update_found = False
                 try:
                     update_element = None
-                    # Strategy 1: by link text
                     try:
                         update_element = row.find_element(By.LINK_TEXT, "Update")
                     except NoSuchElementException:
                         pass
-
-                    # Strategy 2: XPath for any element containing "Update"
                     if not update_element:
                         update_element = row.find_element(By.XPATH, ".//*[contains(translate(text(), 'UPDATE', 'update'), 'update')]")
 
@@ -182,7 +182,7 @@ def process_loan(rec, worker_id, driver):
                         submit_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
                         submit_btn.click()
 
-                        print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} updated: '{remark_val}'")
+                        print(f"[Worker-{worker_id}] [{loan_no}] POD {dms_pod} updated")
                         status_result = "YES"
                         updater_name = "cb112700 (script)"
                         update_found = True
@@ -192,13 +192,11 @@ def process_loan(rec, worker_id, driver):
                 except Exception as e:
                     print(f"[Worker-{worker_id}] [{loan_no}] Update action failed: {e}")
 
-                # If update not performed, check existing data
                 if not update_found:
                     try:
                         if len(cells) > 7:
                             updated_by_text = cells[6].text.strip()
                             received_at_text = cells[7].text.strip()
-
                             received_at_filled = bool(received_at_text) and received_at_text != "-"
                             date_ok = received_at_filled and received_at_text == date_formatted
                             member_ok, matched_team_name = is_team_member(updated_by_text)
@@ -242,7 +240,7 @@ def process_loan(rec, worker_id, driver):
             status_result = "NO"
         write_result(loan_no, status_result, updater_name)
 
-# ==== WORKER WITH LOGIN RETRY ====
+# ==== WORKER WITH LOGIN RETRY AND AUTO-DRIVER ====
 def worker_function(records_batch, worker_id):
     if not records_batch:
         return
@@ -254,9 +252,19 @@ def worker_function(records_batch, worker_id):
         try:
             if driver is not None:
                 driver.quit()
-            driver = webdriver.Chrome()
-            driver.get("https://dcm.chola.murugappa.com/login")
 
+            # ---- Use ChromeDriverManager to get the correct driver ----
+            service = Service(ChromeDriverManager().install())
+            options = webdriver.ChromeOptions()
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            # Uncomment next line if you want headless (no GUI)
+            # options.add_argument("--headless")
+
+            driver = webdriver.Chrome(service=service, options=options)
+
+            driver.get("https://dcm.chola.murugappa.com/login")
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.ID, "username"))
             ).send_keys("cb112700")
@@ -293,14 +301,12 @@ def worker_function(records_batch, worker_id):
 if __name__ == "__main__":
     start_time = time.time()
 
-    # Read input file
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except FileNotFoundError:
         print(f"ERROR: Input file not found: {input_file}")
-        print("Please provide the correct path as command-line argument, e.g.:")
-        print(f"  python {os.path.basename(__file__)} C:\\path\\to\\your\\file.txt")
+        print(f"Please provide correct path, e.g.: python {os.path.basename(__file__)} C:\\path\\to\\file.txt")
         sys.exit(1)
 
     records = []
@@ -326,10 +332,8 @@ if __name__ == "__main__":
     print(f"Using {NUM_WORKERS} parallel workers")
     print(f"Input file: {input_file}")
 
-    # Clear temp status file at start
     open(TEMP_STATUS_FILE, 'w').close()
 
-    # Split records
     def split_records(all_records, num_workers):
         if num_workers <= 0:
             num_workers = 1
@@ -355,7 +359,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Worker error: {e}")
 
-    # Merge temp status into final status.txt (in original order)
+    # Merge temp results
     results_by_loan = {}
     with open(TEMP_STATUS_FILE, 'r', encoding='utf-8') as tf:
         for line in tf:
